@@ -34,10 +34,14 @@ def write_report(path: Path, record: dict) -> None:
     """Write the run as it stands. Called after every step, so a killed run still leaves a truthful report."""
     sessions, organizer, agents = record["sessions"], record["organizer"], record["agents"]
     counts = Counter(session["status"] for session in sessions)
+    models = ", ".join(
+        f"{agent} {model} (effort: {effort or 'API default'})" for agent, (model, effort) in record["models"].items()
+    )
     lines = [
         f"# Dreaming run {record['id']}",
         "",
         f"- Project: {record['project']}",
+        f"- Models: {models}",
         f"- Started: {record['started']}",
         f"- Finished: {record['finished'] or 'no: still running, or the run was interrupted'}",
         "- Sessions: " + (", ".join(f"{count} {status}" for status, count in counts.items()) or "none"),

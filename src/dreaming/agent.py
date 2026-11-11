@@ -118,7 +118,14 @@ def _log_tool_call(tool_log: Path, label: str, call: dict, message) -> None:
 
 
 def run_agent(
-    model: str, system: str, task: str, transcripts: Path, memory: Path, tool_log: Path, label: str
+    model: str,
+    effort: str | None,
+    system: str,
+    task: str,
+    transcripts: Path,
+    memory: Path,
+    tool_log: Path,
+    label: str,
 ) -> AgentRun:
     """Run the agent until it stops calling tools, logging each tool call as it returns.
 
@@ -134,7 +141,7 @@ def run_agent(
             },
         )
         agent = create_agent(
-            model=ChatAnthropic(model=model, max_tokens=64000, streaming=True),
+            model=ChatAnthropic(model=model, max_tokens=64000, streaming=True, reasoning_effort=effort),
             tools=[],
             system_prompt=system,
             middleware=[

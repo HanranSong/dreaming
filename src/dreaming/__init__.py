@@ -2,20 +2,28 @@
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from dreaming.agent import MEMORY_PATH, UPLOADS_PATH, AgentRun, run_agent
 from dreaming.render import render_text
 from dreaming.report import usd, write_report
 from dreaming.sessions import load_session, session_files
 
-# The official cookbook's defaults.
-ANALYZER_MODEL = "claude-haiku-5-5"
-ORGANIZER_MODEL = "claude-haiku-5-5"
+DREAMING_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(DREAMING_DIR / ".env")  # values already set in the environment win
+
+# The default models are the official cookbook's. An empty effort leaves it to the API's default.
+ANALYZER_MODEL = os.getenv("DREAMING_ANALYZER_MODEL") or "claude-haiku-5-5"
+ORGANIZER_MODEL = os.getenv("DREAMING_ORGANIZER_MODEL") or "claude-haiku-5-5"
+ANALYZER_EFFORT = os.getenv("DREAMING_ANALYZER_EFFORT") or None
+ORGANIZER_EFFORT = os.getenv("DREAMING_ORGANIZER_EFFORT") or None
 
 # Claude Code logs have no "finished" marker, so a session counts as finished once its log goes quiet.
 SESSION_QUIET_SECONDS = 30 * 60
@@ -24,7 +32,6 @@ MAX_ATTEMPTS = 3
 # Rolling back only ever needs a recent copy of memory. Reports and tool logs are kept for every run.
 BACKUPS_TO_KEEP = 5
 
-DREAMING_DIR = Path(__file__).resolve().parents[2]
 MEMORY_DIR = DREAMING_DIR / "memory"
 STATE_DIR = DREAMING_DIR / ".state"
 TRANSCRIPT_DIR = STATE_DIR / "transcripts"
@@ -150,7 +157,8 @@ def _analyze(path: Path, tool_log: Path) -> tuple[str, str | None, AgentRun | No
         return "", None, AgentRun(error=f"could not read the session log: {error!r}")
     task = ANALYZER_TASK.format(path=f"{UPLOADS_PATH}/{path.stem}.txt", memory=MEMORY_PATH)
     system = _prompt("analyzer_system.md")
-    run = run_agent(ANALYZER_MODEL, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, f"analyzer {path.stem}")
+    label = f"analyzer {path.stem}"
+    run = run_agent(ANALYZER_MODEL, ANALYZER_EFFORT, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, label)
     return title, _digest(text), run
 
 
@@ -206,6 +214,7 @@ def main() -> None:
     record = {
         "id": run_id,
         "project": str(Path.cwd()),
+        "models": {"analyzer": (ANALYZER_MODEL, ANALYZER_EFFORT), "organizer": (ORGANIZER_MODEL, ORGANIZER_EFFORT)},
         "started": datetime.now(UTC).isoformat(timespec="seconds"),
         "finished": None,
         "sessions": [],
@@ -264,8 +273,9 @@ def main() -> None:
         checkpoint()
         print("Organizer: ", end="", flush=True)
         task = ORGANIZER_TASK.format(memory=MEMORY_PATH)
+        system = _prompt("organizer_system.md")
         run = run_agent(
-            ORGANIZER_MODEL, _prompt("organizer_system.md"), task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, "organizer"
+            ORGANIZER_MODEL, ORGANIZER_EFFORT, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, "organizer"
         )
         record["agents"].append(("organizer", run))
         del organizer["running"]
