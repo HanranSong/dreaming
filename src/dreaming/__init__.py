@@ -15,7 +15,6 @@ from dreaming.agent import MEMORY_PATH, UPLOADS_PATH, AgentRun, run_agent
 from dreaming.render import render_text
 from dreaming.report import usd, write_report
 from dreaming.sessions import load_session, session_files
-from dreaming.split import split_transcript
 
 DREAMING_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(DREAMING_DIR / ".env")  # values already set in the environment win
@@ -25,10 +24,6 @@ ANALYZER_MODEL = os.getenv("DREAMING_ANALYZER_MODEL") or "claude-haiku-5-5"
 ORGANIZER_MODEL = os.getenv("DREAMING_ORGANIZER_MODEL") or "claude-haiku-5-5"
 ANALYZER_EFFORT = os.getenv("DREAMING_ANALYZER_EFFORT") or None
 ORGANIZER_EFFORT = os.getenv("DREAMING_ORGANIZER_EFFORT") or None
-# The most lines one file read returns, whatever limit the agent asks for. A longer transcript is split into parts.
-READ_LIMIT = int(os.getenv("DREAMING_READ_LIMIT") or 25_000)
-if READ_LIMIT < 100:
-    raise SystemExit("DREAMING_READ_LIMIT must be at least 100.")
 
 # Claude Code logs have no "finished" marker, so a session counts as finished once its log goes quiet.
 SESSION_QUIET_SECONDS = 30 * 60
@@ -151,58 +146,19 @@ def _gained_content(path: Path, entry: dict) -> bool:
     return changed
 
 
-def _write_transcript(stem: str, text: str) -> list[str]:
-    """Write a session's transcript, split if one read could not return it whole, and return the file names."""
-    own_file = re.compile(rf"{re.escape(stem)}(\.part\d+of\d+)?\.txt")
-    for stale in TRANSCRIPT_DIR.iterdir():
-        if own_file.fullmatch(stale.name):
-            stale.unlink()
-    parts = split_transcript(text, READ_LIMIT)
-    total = len(parts)
-    names = [f"{stem}.txt"] if total == 1 else [f"{stem}.part{number}of{total}.txt" for number in range(1, total + 1)]
-    for name, part in zip(names, parts):
-        (TRANSCRIPT_DIR / name).write_text(part, encoding="utf-8")
-    return names
-
-
 def _analyze(path: Path, tool_log: Path) -> tuple[str, str | None, AgentRun | None]:
-    """Analyze one session. Returns its title, transcript digest and the agent's run (None if no conversation).
-
-    A session split into parts gets one agent per part, in order, reported as one run that stops at the first failure.
-    """
+    """Analyze one session. Returns its title, transcript digest and the agent's run (None if no conversation)."""
     try:
         title, text = _render(path)
         if text is None:
             return title, None, None
-        names = _write_transcript(path.stem, text)
+        (TRANSCRIPT_DIR / f"{path.stem}.txt").write_text(text, encoding="utf-8")
     except Exception as error:
         return "", None, AgentRun(error=f"could not read the session log: {error!r}")
+    task = ANALYZER_TASK.format(path=f"{UPLOADS_PATH}/{path.stem}.txt", memory=MEMORY_PATH)
     system = _prompt("analyzer_system.md")
-    run, summaries = AgentRun(cost=0.0), []
-    for number, name in enumerate(names, 1):
-        part = "" if len(names) == 1 else f"part {number} of {len(names)}"
-        transcript = f"{UPLOADS_PATH}/{name}"
-        task = ANALYZER_TASK.format(path=transcript, memory=MEMORY_PATH)
-        label = f"analyzer {path.stem} {part}".rstrip()
-        result = run_agent(
-            ANALYZER_MODEL,
-            ANALYZER_EFFORT,
-            system,
-            task,
-            TRANSCRIPT_DIR,
-            MEMORY_DIR,
-            tool_log,
-            label,
-            READ_LIMIT,
-            transcript,
-        )
-        run.usage.update(result.usage)
-        run.cost = None if None in (run.cost, result.cost) else run.cost + result.cost
-        if result.error:
-            run.error = f"{part}: {result.error}" if part else result.error
-            break
-        summaries.append(f"{part.capitalize()}:\n{result.text}" if part else result.text)
-    run.text = "\n\n".join(summaries)
+    label = f"analyzer {path.stem}"
+    run = run_agent(ANALYZER_MODEL, ANALYZER_EFFORT, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, label)
     return title, _digest(text), run
 
 
@@ -319,15 +275,7 @@ def main() -> None:
         task = ORGANIZER_TASK.format(memory=MEMORY_PATH)
         system = _prompt("organizer_system.md")
         run = run_agent(
-            ORGANIZER_MODEL,
-            ORGANIZER_EFFORT,
-            system,
-            task,
-            TRANSCRIPT_DIR,
-            MEMORY_DIR,
-            tool_log,
-            "organizer",
-            READ_LIMIT,
+            ORGANIZER_MODEL, ORGANIZER_EFFORT, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, "organizer"
         )
         record["agents"].append(("organizer", run))
         del organizer["running"]

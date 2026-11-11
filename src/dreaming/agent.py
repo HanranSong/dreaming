@@ -7,8 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from deepagents.backends import CompositeBackend, FilesystemBackend
-from deepagents.backends.protocol import EditResult, ReadResult, WriteResult
-from deepagents.backends.utils import validate_path
+from deepagents.backends.protocol import EditResult, WriteResult
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
@@ -42,24 +41,11 @@ LONG_PROMPT_PRICES = {
     "claude-haiku-5-5": {"over": 100_000, "input": 0.50, "cache_write": 0.625, "cache_read": 0.05, "output": 2.50},
 }
 
-# Tool arguments the tool log leaves out. It records where an agent read and wrote, not what, so file text goes.
-# So does read_file's limit, which the backends replace with the run's own on a read of a file's start.
-UNLOGGED_ARGUMENTS = {"content", "old_string", "new_string", "limit"}
+# Tool arguments that hold file text. The tool log records where an agent read and wrote, not what.
+CONTENT_ARGUMENTS = {"content", "old_string", "new_string"}
 
 
-class LimitedBackend(FilesystemBackend):
-    """Returns up to the run's number of lines from a read of a file's start, whatever limit the agent asked for."""
-
-    def __init__(self, read_limit: int, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.read_limit = read_limit
-
-    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
-        # A later offset keeps the agent's limit: widening it would resend text the agent already has.
-        return super().read(file_path, offset, self.read_limit if offset == 0 else min(limit, self.read_limit))
-
-
-class ReadOnlyBackend(LimitedBackend):
+class ReadOnlyBackend(FilesystemBackend):
     """Refuses every change, whatever the path looks like."""
 
     def write(self, file_path: str, *args, **kwargs) -> WriteResult:
@@ -69,7 +55,7 @@ class ReadOnlyBackend(LimitedBackend):
         return EditResult(error=f"Error: {file_path} is read-only")
 
 
-class MemoryBackend(LimitedBackend):
+class MemoryBackend(FilesystemBackend):
     """Keeps memory to Markdown pages: agents have no delete tool, so a stray file would stay forever."""
 
     def write(self, file_path: str, content: str, *args, **kwargs) -> WriteResult:
@@ -121,7 +107,7 @@ def _log_tool_call(tool_log: Path, label: str, call: dict, message) -> None:
         "time": datetime.now(UTC).isoformat(timespec="seconds"),
         "agent": label,
         "tool": call.get("name"),
-        "args": {key: value for key, value in call.get("args", {}).items() if key not in UNLOGGED_ARGUMENTS},
+        "args": {key: value for key, value in call.get("args", {}).items() if key not in CONTENT_ARGUMENTS},
         "ok": not failed,
         "result_chars": len(text),
     }
@@ -129,17 +115,6 @@ def _log_tool_call(tool_log: Path, label: str, call: dict, message) -> None:
         entry["error"] = text[:500]
     with tool_log.open("a", encoding="utf-8") as log:
         log.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
-def _reads_from_start(call: dict, path: str | None) -> bool:
-    """Whether a tool call reads a path from its first line, however the agent wrote the path."""
-    args = call.get("args", {})
-    if path is None or call.get("name") != "read_file" or args.get("offset"):
-        return False
-    try:
-        return validate_path(args.get("file_path", "")) == validate_path(path)
-    except (TypeError, ValueError):
-        return False
 
 
 def run_agent(
@@ -151,21 +126,18 @@ def run_agent(
     memory: Path,
     tool_log: Path,
     label: str,
-    read_limit: int,
-    must_read: str | None = None,
 ) -> AgentRun:
     """Run the agent until it stops calling tools, logging each tool call as it returns.
 
-    must_read is a path the agent has to read from its first line, or the run counts as failed.
     A failure is returned in the result rather than raised, so the tokens spent before it are still counted.
     """
     run = AgentRun(cost=0.0 if model in PRICES else None)
     try:
         backend = CompositeBackend(
-            default=ReadOnlyBackend(read_limit, root_dir=transcripts, virtual_mode=True),  # only hidden paths get this far
+            default=ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),  # only hidden paths get this far
             routes={
-                f"{UPLOADS_PATH}/": ReadOnlyBackend(read_limit, root_dir=transcripts, virtual_mode=True),
-                f"{MEMORY_PATH}/": MemoryBackend(read_limit, root_dir=memory, virtual_mode=True),
+                f"{UPLOADS_PATH}/": ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),
+                f"{MEMORY_PATH}/": MemoryBackend(root_dir=memory, virtual_mode=True),
             },
         )
         agent = create_agent(
@@ -183,7 +155,7 @@ def run_agent(
                 AnthropicPromptCachingMiddleware(),
             ],
         )
-        messages, calls, has_read = [], {}, False
+        messages, calls = [], {}
         inputs = {"messages": [{"role": "user", "content": task}]}
         # Each step yields the whole conversation so far; only the messages not yet seen are new.
         for state in agent.stream(inputs, {"recursion_limit": 1000, "run_name": label}, stream_mode="values"):
@@ -193,19 +165,14 @@ def run_agent(
                     if message.usage_metadata:
                         _count_usage(run, model, message.usage_metadata)
                 elif message.type == "tool":
-                    call = calls.get(message.tool_call_id, {})
-                    _log_tool_call(tool_log, label, call, message)
-                    if _reads_from_start(call, must_read):
-                        has_read = has_read or message.status != "error"
+                    _log_tool_call(tool_log, label, calls.get(message.tool_call_id, {}), message)
             messages = state["messages"]
 
         stop_reason = messages[-1].response_metadata.get("stop_reason")
-        if stop_reason != "end_turn":
-            run.error = f"agent stopped early: {stop_reason}"
-        elif must_read and not has_read:
-            run.error = f"agent finished without reading {must_read} from its first line"
-        else:
+        if stop_reason == "end_turn":
             run.text = str(messages[-1].text)
+        else:
+            run.error = f"agent stopped early: {stop_reason}"
     except Exception as error:
         run.error = f"{type(error).__name__}: {error}"
     return run
