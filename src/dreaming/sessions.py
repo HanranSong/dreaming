@@ -9,6 +9,9 @@ from pathlib import Path
 PERSISTED_OUTPUT = re.compile(
     r"<persisted-output>\s*[^\n]*Full output saved to: [^\n]*/tool-results/([^\s/]+)"
 )
+# The event that carries a user message's time. render_text has no label for it, so it prints the event as an
+# "EVENT message.time:" line above the message, which is how the analyzer prompt describes it.
+TIME_EVENT = "message.time"
 
 
 def _records(path: Path):
@@ -91,13 +94,20 @@ def _events(record: dict, session_dir: Path):
 
 
 def _log_events(path: Path, session_dir: Path) -> list[dict]:
-    events = []
+    events, timed = [], None
     for record in _records(path):
         # Text the user did not write: isMeta marks injected text such as skill bodies, and isCompactSummary
         # a model-written summary of earlier messages, which stay in the log.
         injected = record.get("isMeta") or record.get("isCompactSummary")
         if record.get("type") in ("user", "assistant") and not injected:
-            events.extend(_events(record, session_dir))
+            new = list(_events(record, session_dir))
+            # A session can run for days or be resumed later, so each user message gets its own time, to the
+            # second. Records logged at the same moment share one.
+            time = (record.get("timestamp") or "")[:19]
+            if time and time != timed and any(event["type"] == "user.message" for event in new):
+                events.append({"type": TIME_EVENT, "utc": f"{time}Z"})
+                timed = time
+            events.extend(new)
     return events
 
 
@@ -118,8 +128,17 @@ def _subagent_threads(session_dir: Path) -> list[dict]:
     return threads
 
 
+def without_times(export: dict) -> dict:
+    """A session's export with the time events taken out: what was said, whenever it was said."""
+    threads = [
+        {**thread, "events": [event for event in thread["events"] if event["type"] != TIME_EVENT]}
+        for thread in export["threads"]
+    ]
+    return {**export, "threads": threads}
+
+
 def load_session(path: Path) -> dict:
-    """One session log and its subagents as the dict render_text takes."""
+    """One session log and its subagents as the dict render_text takes, with a time event above user messages."""
     session_dir = path.with_suffix("")
     title = ""
     for record in _records(path):

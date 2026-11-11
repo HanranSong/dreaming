@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from dreaming.agent import MEMORY_PATH, UPLOADS_PATH, AgentRun, run_agent
 from dreaming.render import render_text
 from dreaming.report import usd, write_report
-from dreaming.sessions import load_session, log_stat, session_files
+from dreaming.sessions import load_session, log_stat, session_files, without_times
 
 DREAMING_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(DREAMING_DIR / ".env")  # values already set in the environment win
@@ -139,17 +139,18 @@ def _prune_backups() -> None:
         shutil.rmtree(backup)
 
 
-def _render(path: Path) -> tuple[str, str | None]:
-    """A session's title and transcript text. The text is None when the session has no conversation."""
+def _render(path: Path) -> tuple[str, str | None, str | None]:
+    """A session's title, transcript text and digest. The last two are None when it has no conversation.
+
+    The digest leaves the transcript's time lines out. It tells whether the conversation changed, and it stays
+    what it was for sessions analyzed before transcripts had those lines.
+    """
     export = load_session(path)
     title = export["session"]["title"]
     if not any(thread["events"] for thread in export["threads"]):
-        return title, None
-    return title, render_text(export)
-
-
-def _digest(text: str | None) -> str | None:
-    return None if text is None else hashlib.sha256(text.encode(errors="replace")).hexdigest()
+        return title, None, None
+    untimed = render_text(without_times(export))
+    return title, render_text(export), hashlib.sha256(untimed.encode(errors="replace")).hexdigest()
 
 
 def _gained_content(path: Path, entry: dict, signature: str) -> bool:
@@ -157,7 +158,7 @@ def _gained_content(path: Path, entry: dict, signature: str) -> bool:
     if entry.get("log_signature") == signature:  # no log file was touched, so the transcript is the same
         return False
     try:
-        digest = _digest(_render(path)[1])
+        digest = _render(path)[2]
     except Exception:
         return False
     changed = "transcript_sha256" in entry and digest != entry["transcript_sha256"]
@@ -169,7 +170,7 @@ def _gained_content(path: Path, entry: dict, signature: str) -> bool:
 def _analyze(path: Path, run_dir: Path) -> tuple[str, str | None, AgentRun | None]:
     """Analyze one session. Returns its title, transcript digest and the agent's run (None if no conversation)."""
     try:
-        title, text = _render(path)
+        title, text, digest = _render(path)
         if text is None:
             return title, None, None
         (TRANSCRIPT_DIR / f"{path.stem}.txt").write_text(text, encoding="utf-8")
@@ -191,7 +192,7 @@ def _analyze(path: Path, run_dir: Path) -> tuple[str, str | None, AgentRun | Non
         COMPACT_AT_PERCENT,
         _prompt("analyzer_compaction.md"),
     )
-    return title, _digest(text), run
+    return title, digest, run
 
 
 def main() -> None:

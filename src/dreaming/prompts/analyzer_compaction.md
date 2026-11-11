@@ -5,10 +5,10 @@ The history may open with a summary from an earlier compaction. Carry everything
 Write these sections, each filled in or marked "None":
 
 ## Reading position
-The last line of the transcript the agent has read in this history (read results show line numbers), the offset to continue from, and whether it has reached the end of the transcript.
+The last line of the transcript the agent has read in this history (read results show line numbers), the offset to continue from, the last `EVENT message.time:` line it has read, and whether it has reached the end of the transcript.
 
 ## Candidate facts
-Every durable fact the transcript has shown so far that has not yet been written to memory and confirmed by reading it back. Keep exact identifiers, names, paths, commands, flags, values, abbreviations and error text verbatim, and give the transcript line each fact came from. Include causal mechanisms, how and when a fact was verified, what may be stale or uncertain, and process observations: mistakes, misunderstandings, unexpected results and approaches that burned turns.
+Every durable fact the transcript has shown so far that has not yet been written to memory and confirmed by reading it back. Keep exact identifiers, names, paths, commands, flags, values, abbreviations and error text verbatim, and give the transcript line each fact came from and, for what the project's people said, the time on the `EVENT message.time:` line above it. Include causal mechanisms, how and when a fact was verified, what may be stale or uncertain, and process observations: mistakes, misunderstandings, unexpected results and approaches that burned turns.
 
 ## Memory files
 Which memory files have been read, and what each claims that still needs checking against the transcript. Which have been created or changed and how, and whether each change has been read back. Note any claim the transcript contradicts or weakens.

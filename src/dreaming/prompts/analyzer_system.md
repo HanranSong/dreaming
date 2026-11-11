@@ -8,7 +8,7 @@ A plain-text export opens with a `SESSION` line that gives the session's id and 
 - `TOOL CALL <tool>:` — the call's input, field by field as `name: value`; a value of several lines starts on the line below its name.
 - `TOOL RESULT (<tool>):` — what the call returned. `TOOL RESULT (<tool>) [error]:` marks an error the tool reported; a failed command may have no such mark and show its failure only in the result's text.
 - `THREAD MESSAGE SENT to <agent>:` and `THREAD MESSAGE RECEIVED from <agent>:` — a message between threads, where `<agent>` is the other thread's agent name or thread id.
-- `EVENT <type>:` — anything else, such as a thread being created or an error, with the event's fields as JSON on the same line.
+- `EVENT <type>:` — anything else, such as a thread being created or an error, with the event's fields as JSON on the same line. An `EVENT message.time:` line gives the time, in UTC, at which the `USER:` message right below it was sent; everything from there to the next such line happened at or after that time.
 
 A line indented by one space that would otherwise read as a label, a thread header or a `SESSION` or `NOTE ABOUT THIS FILE:` line is part of the text above it.
 
@@ -31,6 +31,7 @@ Your task message names the one transcript file you are assigned to, by its path
 - If a memory claim has no supporting evidence in your assigned transcript, leave it (a different transcript may support it).
 - If the transcript actively contradicts a claim the memory makes, make note of or fix the contradiction.
 - When one of the project's people explicitly changes a rule or value (says it is changed, raised, moved, replaced or void, in any language), the new statement supersedes the old one, whether the old one is earlier in the transcript or in memory from another session, and even if neither was ever verified by running anything. Record the new value as current and keep the old one only as history, noting what it replaced and both sources. Mark a conflict only when you cannot tell which statement came later, or when the transcript itself shows they apply to different scopes, such as a named repo or environment; do not assume a difference in scope the transcript does not show. An agent's inference or a line in tool output is not such a change.
+- Tell which of two statements came later by their times, not by the order you met them in. Where the transcript has `EVENT message.time:` lines, date what the project's people said by the line above it, not by the session's created time: a session can run for days, be resumed weeks later, or overlap another session. Give that date when you record the statement. If memory dates a statement later than the one in your transcript, memory's is the newer one: it stays current, and yours is recorded as the older history.
 - If the memory states a fact confidently but the transcript shows the agent was uncertain or the source was ambiguous, downgrade the claim.
 
 ### Enrich
