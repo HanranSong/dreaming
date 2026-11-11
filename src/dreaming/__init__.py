@@ -1,5 +1,6 @@
 """Dream over this project's Claude Code sessions into a local memory directory."""
 
+import hashlib
 import json
 import re
 import shutil
@@ -102,21 +103,47 @@ def _remove_stubs() -> int:
     return len(stubs)
 
 
-def _analyze(path: Path, tool_log: Path) -> tuple[str, AgentRun | None]:
-    """Analyze one session. Returns its title and the agent's run, or no run when it has no conversation."""
+def _render(path: Path) -> tuple[str, str | None]:
+    """A session's title and transcript text. The text is None when the session has no conversation."""
+    export = load_session(path)
+    title = export["session"]["title"]
+    if not any(thread["events"] for thread in export["threads"]):
+        return title, None
+    return title, render_text(export)
+
+
+def _digest(text: str | None) -> str | None:
+    return None if text is None else hashlib.sha256(text.encode(errors="replace")).hexdigest()
+
+
+def _gained_content(path: Path, entry: dict) -> bool:
+    """Whether a finished session's conversation has changed since it was analyzed."""
+    size = path.stat().st_size
+    if entry.get("log_size") == size:
+        return False
     try:
-        export = load_session(path)
-        title = export["session"]["title"]
-        if not any(thread["events"] for thread in export["threads"]):
-            return title, None
-        (TRANSCRIPT_DIR / f"{path.stem}.txt").write_text(render_text(export), encoding="utf-8")
+        digest = _digest(_render(path)[1])
+    except Exception:
+        return False
+    changed = "transcript_sha256" in entry and digest != entry["transcript_sha256"]
+    if not changed:  # only metadata grew, or the session predates these fields: this is the new baseline
+        entry.update(log_size=size, transcript_sha256=digest)
+    return changed
+
+
+def _analyze(path: Path, tool_log: Path) -> tuple[str, str | None, AgentRun | None]:
+    """Analyze one session. Returns its title, transcript digest and the agent's run (None if no conversation)."""
+    try:
+        title, text = _render(path)
+        if text is None:
+            return title, None, None
+        (TRANSCRIPT_DIR / f"{path.stem}.txt").write_text(text, encoding="utf-8")
     except Exception as error:
-        return "", AgentRun(error=f"could not read the session log: {error!r}")
+        return "", None, AgentRun(error=f"could not read the session log: {error!r}")
     task = ANALYZER_TASK.format(path=f"{UPLOADS_PATH}/{path.stem}.txt", memory=MEMORY_PATH)
     system = _prompt("analyzer_system.md")
-    return title, run_agent(
-        ANALYZER_MODEL, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, f"analyzer {path.stem}"
-    )
+    run = run_agent(ANALYZER_MODEL, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, f"analyzer {path.stem}")
+    return title, _digest(text), run
 
 
 def main() -> None:
@@ -130,21 +157,29 @@ def main() -> None:
         if entry["status"] == "running":
             entry.update(status="failed", attempts=entry["attempts"] + 1, error=INTERRUPTED)
             organizer.update(pending=True, attempts=0)
-    _save_state(state)
+    if organizer.pop("running", False):
+        organizer["attempts"] += 1
+        organizer["error"] = INTERRUPTED
 
     cutoff = time.time() - SESSION_QUIET_SECONDS
-    pending, not_run = [], []
+    pending, not_run, resumed = [], [], set()
     for path in session_files(Path.cwd()):
         entry = sessions.get(path.stem, {})
-        if entry.get("status") in ("done", "skipped"):
+        finished = entry.get("status") in ("done", "skipped")
+        gained = finished and _gained_content(path, entry)
+        if finished and not gained:
             continue
-        if entry.get("attempts", 0) >= MAX_ATTEMPTS:
+        if not gained and entry.get("attempts", 0) >= MAX_ATTEMPTS:
             reason = f"gave up after {MAX_ATTEMPTS} failed attempts; last error: {entry.get('error')}"
             not_run.append((path.stem, reason))
         elif path.stat().st_mtime >= cutoff:
             not_run.append((path.stem, "waiting: its log changed in the last 30 minutes"))
         else:
             pending.append(path)
+            if gained:  # new content gets a fresh set of attempts
+                resumed.add(path.stem)
+                entry["attempts"] = 0
+    _save_state(state)
     for session_id, reason in not_run:
         print(f"Not run {session_id}: {reason}")
 
@@ -181,13 +216,16 @@ def main() -> None:
     for number, path in enumerate(pending, 1):
         entry = sessions.setdefault(path.stem, {"attempts": 0})
         result = {"id": path.stem, "status": "running", "previous_error": entry.pop("error", None)}
+        if path.stem in resumed:
+            result["note"] = "Analyzed again: the conversation changed after its last analysis."
         record["sessions"].append(result)
         entry.update(status="running", last_run=run_id)
         checkpoint()
         print(f"[{number}/{len(pending)}] {path.stem}: ", end="", flush=True)
 
         memory_before = _files(MEMORY_DIR)
-        result["title"], run = _analyze(path, tool_log)
+        log_size = path.stat().st_size  # taken before reading, so anything appended meanwhile counts as new
+        result["title"], digest, run = _analyze(path, tool_log)
         if run is None:
             entry["status"] = "skipped"
             result["note"] = "No conversation in this session."
@@ -207,11 +245,14 @@ def main() -> None:
             else:
                 result["summary"] = run.text
                 print(f"done ({run.usage['requests']} requests, {usd(run.cost)})")
+        if entry["status"] != "failed":
+            entry.update(log_size=log_size, transcript_sha256=digest)
         result["status"] = entry["status"]
         checkpoint()
 
     if organizer["pending"] and organizer["attempts"] < MAX_ATTEMPTS:
         record["organizer"] = {"status": "running"}
+        organizer["running"] = True  # still set on the next start means this run was killed here
         checkpoint()
         print("Organizer: ", end="", flush=True)
         task = ORGANIZER_TASK.format(memory=MEMORY_PATH)
@@ -219,6 +260,7 @@ def main() -> None:
             ORGANIZER_MODEL, _prompt("organizer_system.md"), task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, "organizer"
         )
         record["agents"].append(("organizer", run))
+        del organizer["running"]
         if run.error:
             organizer["attempts"] += bool(run.usage["requests"])
             organizer["error"] = run.error

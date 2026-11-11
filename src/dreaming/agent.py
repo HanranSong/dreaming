@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from deepagents.backends import CompositeBackend, FilesystemBackend
+from deepagents.backends.protocol import EditResult, WriteResult
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
@@ -19,7 +20,8 @@ MEMORY_PATH = "/mnt/memory/dreaming"
 # The official analyzer and organizer toolset: read, write, edit, glob and grep.
 TOOLS = ["read_file", "write_file", "edit_file", "glob", "grep"]
 
-# The first matching rule wins: transcripts are read-only, memory is read-write, everything else is denied.
+# The first matching rule wins and a path no rule matches is allowed. These globs do not match hidden paths,
+# so ReadOnlyBackend is what actually keeps agents from writing anywhere but memory.
 PERMISSIONS = [
     FilesystemPermission(operations=["write"], paths=[f"{UPLOADS_PATH}/**"], mode="deny"),
     FilesystemPermission(operations=["read"], paths=[f"{UPLOADS_PATH}/**"], mode="allow"),
@@ -41,6 +43,16 @@ LONG_PROMPT_PRICES = {
 
 # Tool arguments that hold file text. The tool log records where an agent read and wrote, not what.
 CONTENT_ARGUMENTS = {"content", "old_string", "new_string"}
+
+
+class ReadOnlyBackend(FilesystemBackend):
+    """Refuses every change, whatever the path looks like."""
+
+    def write(self, file_path: str, *args, **kwargs) -> WriteResult:
+        return WriteResult(error=f"Error: {file_path} is read-only")
+
+    def edit(self, file_path: str, *args, **kwargs) -> EditResult:
+        return EditResult(error=f"Error: {file_path} is read-only")
 
 
 @dataclass
@@ -106,9 +118,9 @@ def run_agent(
     run = AgentRun(cost=0.0 if model in PRICES else None)
     try:
         backend = CompositeBackend(
-            default=FilesystemBackend(root_dir=transcripts, virtual_mode=True),  # never reached: denied above
+            default=ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),  # only hidden paths get this far
             routes={
-                f"{UPLOADS_PATH}/": FilesystemBackend(root_dir=transcripts, virtual_mode=True),
+                f"{UPLOADS_PATH}/": ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),
                 f"{MEMORY_PATH}/": FilesystemBackend(root_dir=memory, virtual_mode=True),
             },
         )
