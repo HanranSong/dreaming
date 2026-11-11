@@ -74,8 +74,10 @@ def _events(record: dict, session_dir: Path):
 def _log_events(path: Path, session_dir: Path) -> list[dict]:
     events = []
     for record in _records(path):
-        # isMeta marks text the harness injected, such as skill bodies, rather than what the user wrote.
-        if record.get("type") in ("user", "assistant") and not record.get("isMeta"):
+        # Text the user did not write: isMeta marks injected text such as skill bodies, and isCompactSummary
+        # a model-written summary of earlier messages, which stay in the log.
+        injected = record.get("isMeta") or record.get("isCompactSummary")
+        if record.get("type") in ("user", "assistant") and not injected:
             events.extend(_events(record, session_dir))
     return events
 
