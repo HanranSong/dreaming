@@ -55,6 +55,15 @@ class ReadOnlyBackend(FilesystemBackend):
         return EditResult(error=f"Error: {file_path} is read-only")
 
 
+class MemoryBackend(FilesystemBackend):
+    """Keeps memory to Markdown pages: agents have no delete tool, so a stray file would stay forever."""
+
+    def write(self, file_path: str, content: str, *args, **kwargs) -> WriteResult:
+        if not file_path.endswith(".md"):
+            return WriteResult(error=f"Error: memory files must end in .md: {file_path}")
+        return super().write(file_path, content, *args, **kwargs)
+
+
 @dataclass
 class AgentRun:
     """What one agent run produced. error is set when the agent did not finish normally."""
@@ -121,7 +130,7 @@ def run_agent(
             default=ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),  # only hidden paths get this far
             routes={
                 f"{UPLOADS_PATH}/": ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),
-                f"{MEMORY_PATH}/": FilesystemBackend(root_dir=memory, virtual_mode=True),
+                f"{MEMORY_PATH}/": MemoryBackend(root_dir=memory, virtual_mode=True),
             },
         )
         agent = create_agent(
