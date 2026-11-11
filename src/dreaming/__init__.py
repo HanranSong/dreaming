@@ -19,11 +19,27 @@ from dreaming.sessions import load_session, session_files
 DREAMING_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(DREAMING_DIR / ".env")  # values already set in the environment win
 
+
+def _whole_number(name: str, low: int, high: float = float("inf")) -> int | None:
+    """A whole-number setting, or None when empty. A bad value stops the program before anything is spent."""
+    text = os.getenv(name)
+    if not text:
+        return None
+    if not (text.isdecimal() and low <= int(text) <= high):
+        limits = f"from {low} to {high}" if high != float("inf") else f"of at least {low}"
+        raise SystemExit(f"{name} must be a whole number {limits}, not {text!r}")
+    return int(text)
+
+
 # The default models are the official cookbook's. An empty effort leaves it to the API's default.
 ANALYZER_MODEL = os.getenv("DREAMING_ANALYZER_MODEL") or "claude-haiku-5-5"
 ORGANIZER_MODEL = os.getenv("DREAMING_ORGANIZER_MODEL") or "claude-haiku-5-5"
 ANALYZER_EFFORT = os.getenv("DREAMING_ANALYZER_EFFORT") or None
 ORGANIZER_EFFORT = os.getenv("DREAMING_ORGANIZER_EFFORT") or None
+# An empty context window uses the model's own. The percent stays above 10 because compaction keeps the latest 10%.
+ANALYZER_CONTEXT_WINDOW = _whole_number("DREAMING_ANALYZER_CONTEXT_WINDOW", 1000)
+ORGANIZER_CONTEXT_WINDOW = _whole_number("DREAMING_ORGANIZER_CONTEXT_WINDOW", 1000)
+COMPACT_AT_PERCENT = _whole_number("DREAMING_COMPACT_AT_PERCENT", 11, 100) or 85
 
 # Claude Code logs have no "finished" marker, so a session counts as finished once its log goes quiet.
 SESSION_QUIET_SECONDS = 30 * 60
@@ -146,7 +162,7 @@ def _gained_content(path: Path, entry: dict) -> bool:
     return changed
 
 
-def _analyze(path: Path, tool_log: Path) -> tuple[str, str | None, AgentRun | None]:
+def _analyze(path: Path, run_dir: Path) -> tuple[str, str | None, AgentRun | None]:
     """Analyze one session. Returns its title, transcript digest and the agent's run (None if no conversation)."""
     try:
         title, text = _render(path)
@@ -158,7 +174,19 @@ def _analyze(path: Path, tool_log: Path) -> tuple[str, str | None, AgentRun | No
     task = ANALYZER_TASK.format(path=f"{UPLOADS_PATH}/{path.stem}.txt", memory=MEMORY_PATH)
     system = _prompt("analyzer_system.md")
     label = f"analyzer {path.stem}"
-    run = run_agent(ANALYZER_MODEL, ANALYZER_EFFORT, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, label)
+    run = run_agent(
+        ANALYZER_MODEL,
+        ANALYZER_EFFORT,
+        system,
+        task,
+        TRANSCRIPT_DIR,
+        MEMORY_DIR,
+        run_dir,
+        label,
+        ANALYZER_CONTEXT_WINDOW,
+        COMPACT_AT_PERCENT,
+        _prompt("analyzer_compaction.md"),
+    )
     return title, _digest(text), run
 
 
@@ -210,11 +238,15 @@ def main() -> None:
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True)
     shutil.copytree(MEMORY_DIR, run_dir / "memory_before")
-    tool_log = run_dir / "tool_calls.jsonl"
     record = {
         "id": run_id,
         "project": str(Path.cwd()),
         "models": {"analyzer": (ANALYZER_MODEL, ANALYZER_EFFORT), "organizer": (ORGANIZER_MODEL, ORGANIZER_EFFORT)},
+        "compaction": {
+            "percent": COMPACT_AT_PERCENT,
+            "analyzer": ANALYZER_CONTEXT_WINDOW,
+            "organizer": ORGANIZER_CONTEXT_WINDOW,
+        },
         "started": datetime.now(UTC).isoformat(timespec="seconds"),
         "finished": None,
         "sessions": [],
@@ -242,7 +274,7 @@ def main() -> None:
 
         memory_before = _files(MEMORY_DIR)
         log_size = path.stat().st_size  # taken before reading, so anything appended meanwhile counts as new
-        result["title"], digest, run = _analyze(path, tool_log)
+        result["title"], digest, run = _analyze(path, run_dir)
         if run is None:
             entry["status"] = "skipped"
             result["note"] = "No conversation in this session."
@@ -275,7 +307,16 @@ def main() -> None:
         task = ORGANIZER_TASK.format(memory=MEMORY_PATH)
         system = _prompt("organizer_system.md")
         run = run_agent(
-            ORGANIZER_MODEL, ORGANIZER_EFFORT, system, task, TRANSCRIPT_DIR, MEMORY_DIR, tool_log, "organizer"
+            ORGANIZER_MODEL,
+            ORGANIZER_EFFORT,
+            system,
+            task,
+            TRANSCRIPT_DIR,
+            MEMORY_DIR,
+            run_dir,
+            "organizer",
+            ORGANIZER_CONTEXT_WINDOW,
+            COMPACT_AT_PERCENT,
         )
         record["agents"].append(("organizer", run))
         del organizer["running"]

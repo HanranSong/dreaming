@@ -30,6 +30,7 @@ Your task message names the one transcript file you are assigned to, by its path
 - For the information in the related memory files, find the supporting evidence in the transcript and decide whether the memory claim holds. Do this in your thinking, not in files, and do NOT use line counts as a proxy for correctness.
 - If a memory claim has no supporting evidence in your assigned transcript, leave it (a different transcript may support it).
 - If the transcript actively contradicts a claim the memory makes, make note of or fix the contradiction.
+- When one of the project's people explicitly changes a rule or value (says it is changed, raised, moved, replaced or void, in any language), the new statement supersedes the old one, whether the old one is earlier in the transcript or in memory from another session, and even if neither was ever verified by running anything. Record the new value as current and keep the old one only as history, noting what it replaced and both sources. Mark a conflict only when you cannot tell which statement came later, or when the transcript itself shows they apply to different scopes, such as a named repo or environment; do not assume a difference in scope the transcript does not show. An agent's inference or a line in tool output is not such a change.
 - If the memory states a fact confidently but the transcript shows the agent was uncertain or the source was ambiguous, downgrade the claim.
 
 ### Enrich
@@ -66,9 +67,15 @@ When done, return an object with one field, `summary`: one paragraph on what thi
 
 ### Work in as few turns as you can
 Every turn you take sends your whole context to the model again, the transcript you have read included, and resending it is most of what this run costs. Do the same work in fewer, larger turns:
-- Read your assigned transcript once, from start to end, one read call per turn when it takes several pages, and do not read any part of it a second time unless it has dropped out of your context: what you have read normally stays there.
+- Read your assigned transcript once, from start to end, one read call per turn when it takes several pages, and do not read any part of it a second time unless it has dropped out of your context and you need those exact lines: what you have read normally stays there.
 - Survey the memory directory once to find the files related to your transcript: one glob of its layout and the greps you need. Before you create a file, still glob for its name and for similar names, as the rules above say, to avoid duplicate topics.
 - Read each related memory file once, in full, before you change it. Then give the file its changes in as few calls as you can: a new file in one write, and targeted edits for a file that already exists, each edit carrying as many of your additions as fit in one place.
 - After every write or edit, read the file back to verify it, in a later turn than the change. If a change did not land or an edit failed, re-read the file, fix it and verify again. Apart from these cases, do not read a file a second time unless it has dropped out of your context.
 - Within your own run, when calls do not depend on one another's results (reading several memory files, or changing several different files), make them together in one turn instead of one per turn. Keep dependent calls, including a write and its read-back, in separate turns; transcript pages are also read one turn at a time. A turn can change a given file only once, and a second change to it in that turn is rejected, so put several changes to one file in separate turns or combine them into one larger edit.
 This changes how many turns you take, not what the rules above ask of you.
+
+### If your context is compacted
+On a long transcript, your earlier turns may be replaced by a summary, followed by your most recent turns. Lines you read before the summary count as read for step 1, so reading the transcript IN FULL still means every line once.
+- Carry on reading from the position the summary records, or from further on if your recent turns have passed it. Do not start the transcript again from the beginning.
+- When you verify a fact and the summary does not carry the exact wording or value, go back for just those lines: grep the transcript for it, then read that part with an offset and a limit. The saved conversation history the summary points to can be searched the same way. Never read either one from start to end again.
+- Memory files follow the rules above: if one has dropped out of your context, read it again in full before you change it.

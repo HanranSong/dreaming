@@ -9,7 +9,12 @@ USAGE_COLUMNS = {
     "Cache read": "cache_read",
     "Cache write": "cache_write",
     "Output": "output",
+    "Compactions": "compactions",
 }
+
+
+def _window(tokens: int | None) -> str:
+    return "the model's own" if tokens is None else f"{tokens:,} tokens"
 
 
 def usd(cost: float | None) -> str:
@@ -37,18 +42,22 @@ def write_report(path: Path, record: dict) -> None:
     models = ", ".join(
         f"{agent} {model} (effort: {effort or 'API default'})" for agent, (model, effort) in record["models"].items()
     )
+    compaction = record["compaction"]
     lines = [
         f"# Dreaming run {record['id']}",
         "",
         f"- Project: {record['project']}",
         f"- Models: {models}",
+        f"- Compaction: at {compaction['percent']}% of the context window "
+        f"(analyzer: {_window(compaction['analyzer'])}, organizer: {_window(compaction['organizer'])})",
         f"- Started: {record['started']}",
         f"- Finished: {record['finished'] or 'no: still running, or the run was interrupted'}",
         "- Sessions: " + (", ".join(f"{count} {status}" for status, count in counts.items()) or "none"),
         f"- Organizer: {organizer['status']}",
         f"- Estimated cost: {usd(_total_cost(agents))} at list price",
-        "- Also in this folder: tool_calls.jsonl (each tool call an agent made) and memory_before/ "
-        "(memory as it was before this run, kept for the latest runs only)",
+        "- Also in this folder: tool_calls.jsonl (each tool call an agent made), memory_before/ "
+        "(memory as it was before this run, kept for the latest runs only) and, if an agent's context "
+        "was compacted, conversation_history/ (the messages compaction replaced)",
         "",
         "## Sessions",
     ]

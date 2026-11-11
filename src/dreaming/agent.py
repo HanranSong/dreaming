@@ -9,13 +9,18 @@ from pathlib import Path
 from deepagents.backends import CompositeBackend, FilesystemBackend
 from deepagents.backends.protocol import EditResult, WriteResult
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
+from deepagents.middleware.summarization import DEEPAGENTS_DEFAULT_SUMMARY_PROMPT, SummarizationMiddleware
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
+from langchain_core.callbacks import BaseCallbackHandler
 
 # The official prompts hard-code the transcript path, so the tools expose the same virtual paths.
 UPLOADS_PATH = "/mnt/session/uploads"
 MEMORY_PATH = "/mnt/memory/dreaming"
+# Where compaction saves the messages it replaces. DeepAgents fixes this name.
+HISTORY_PATH = "/conversation_history"
+READ_ONLY_PATHS = [f"{UPLOADS_PATH}/**", f"{HISTORY_PATH}/**"]
 
 # The official analyzer and organizer toolset: read, write, edit, glob and grep.
 TOOLS = ["read_file", "write_file", "edit_file", "glob", "grep"]
@@ -23,8 +28,8 @@ TOOLS = ["read_file", "write_file", "edit_file", "glob", "grep"]
 # The first matching rule wins and a path no rule matches is allowed. These globs do not match hidden paths,
 # so ReadOnlyBackend is what actually keeps agents from writing anywhere but memory.
 PERMISSIONS = [
-    FilesystemPermission(operations=["write"], paths=[f"{UPLOADS_PATH}/**"], mode="deny"),
-    FilesystemPermission(operations=["read"], paths=[f"{UPLOADS_PATH}/**"], mode="allow"),
+    FilesystemPermission(operations=["write"], paths=READ_ONLY_PATHS, mode="deny"),
+    FilesystemPermission(operations=["read"], paths=READ_ONLY_PATHS, mode="allow"),
     FilesystemPermission(operations=["read", "write"], paths=[MEMORY_PATH, f"{MEMORY_PATH}/**"], mode="allow"),
     FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny"),
 ]
@@ -43,6 +48,9 @@ LONG_PROMPT_PRICES = {
 
 # Tool arguments that hold file text. The tool log records where an agent read and wrote, not what.
 CONTENT_ARGUMENTS = {"content", "old_string", "new_string"}
+
+# How much of the context window compaction leaves unsummarized.
+KEEP_PERCENT = 10
 
 
 class ReadOnlyBackend(FilesystemBackend):
@@ -100,6 +108,24 @@ def _count_usage(run: AgentRun, model: str, metadata: dict) -> None:
         ) / 1_000_000
 
 
+class SummaryCallWatcher(BaseCallbackHandler):
+    """Accounts for compaction's summary calls, which never reach the agent's message list."""
+
+    raise_error = True  # a cut-off summary must fail the run, not silently replace the agent's context
+
+    def __init__(self, run: AgentRun, model: str) -> None:
+        self.run = run
+        self.model = model
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        message = response.generations[0][0].message
+        _count_usage(self.run, self.model, message.usage_metadata or {})
+        stop_reason = message.response_metadata.get("stop_reason")
+        if stop_reason != "end_turn":
+            raise RuntimeError(f"compaction summary stopped early: {stop_reason}")
+        self.run.usage["compactions"] += 1
+
+
 def _log_tool_call(tool_log: Path, label: str, call: dict, message) -> None:
     failed = message.status == "error"
     text = str(message.text)
@@ -124,24 +150,34 @@ def run_agent(
     task: str,
     transcripts: Path,
     memory: Path,
-    tool_log: Path,
+    run_dir: Path,
     label: str,
+    context_window: int | None,
+    compact_at_percent: int,
+    summary_prompt: str = DEEPAGENTS_DEFAULT_SUMMARY_PROMPT,
 ) -> AgentRun:
     """Run the agent until it stops calling tools, logging each tool call as it returns.
 
+    Compaction starts at compact_at_percent of context_window, or of the model's own window when that is None.
     A failure is returned in the result rather than raised, so the tokens spent before it are still counted.
     """
     run = AgentRun(cost=0.0 if model in PRICES else None)
+    tool_log = run_dir / "tool_calls.jsonl"
     try:
+        chat_model = ChatAnthropic(model=model, max_tokens=64000, streaming=True, reasoning_effort=effort)
+        window = context_window or (chat_model.profile or {}).get("max_input_tokens")
+        if not window:
+            raise ValueError(f"no known context window for {model}: set its CONTEXT_WINDOW in .env")
         backend = CompositeBackend(
             default=ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),  # only hidden paths get this far
             routes={
                 f"{UPLOADS_PATH}/": ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),
                 f"{MEMORY_PATH}/": MemoryBackend(root_dir=memory, virtual_mode=True),
+                f"{HISTORY_PATH}/": ReadOnlyBackend(root_dir=run_dir / HISTORY_PATH.lstrip("/"), virtual_mode=True),
             },
         )
         agent = create_agent(
-            model=ChatAnthropic(model=model, max_tokens=64000, streaming=True, reasoning_effort=effort),
+            model=chat_model,
             tools=[],
             system_prompt=system,
             middleware=[
@@ -151,6 +187,17 @@ def run_agent(
                     tools=TOOLS,
                     tool_token_limit_before_evict=None,
                     permissions=PERMISSIONS,
+                ),
+                SummarizationMiddleware(
+                    model=chat_model.model_copy(update={"callbacks": [SummaryCallWatcher(run, model)]}),
+                    # Its own backend: only compaction may write the history, agents just read it back.
+                    backend=FilesystemBackend(root_dir=run_dir, virtual_mode=True),
+                    # Absolute tokens, so the model's real window cannot rescale them. Setting that window to
+                    # context_window instead would also shrink the middleware's hard limit by max_tokens.
+                    trigger=("tokens", window * compact_at_percent // 100),
+                    keep=("tokens", window * KEEP_PERCENT // 100),
+                    summary_prompt=summary_prompt,
+                    trim_tokens_to_summarize=None,  # the default would summarize only the last 4,000 tokens
                 ),
                 AnthropicPromptCachingMiddleware(),
             ],
