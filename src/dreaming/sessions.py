@@ -1,5 +1,6 @@
 """Read Claude Code session logs into the export shape render.py expects."""
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -31,6 +32,24 @@ def session_files(project_root: Path) -> list[Path]:
     """The session logs Claude Code keeps for this project, earliest session first."""
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(project_root))
     return sorted((Path.home() / ".claude" / "projects" / slug).glob("*.jsonl"), key=_started_at)
+
+
+def log_stat(path: Path) -> tuple[str, float]:
+    """A signature of the files a session's transcript is read from, and when the newest of them changed.
+
+    These are the session log, its subagents' logs and the tool outputs saved beside them. The signature is
+    a hash of each one's name, size and modification time, so it changes when any of them is added, removed
+    or written to, even if the sizes still add up to the same total.
+    """
+    session_dir = path.with_suffix("")
+    files = sorted([path, *session_dir.glob("subagents/**/agent-*"), *session_dir.glob("tool-results/*")])
+    stats = [file.stat() for file in files]
+    lines = [
+        f"{file.relative_to(path.parent)} {stat.st_size} {stat.st_mtime_ns}"
+        for file, stat in zip(files, stats, strict=True)
+    ]
+    signature = hashlib.sha256("\n".join(lines).encode(errors="replace")).hexdigest()
+    return signature, max(stat.st_mtime for stat in stats)
 
 
 def _full_result(content, session_dir: Path):

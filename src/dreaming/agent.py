@@ -20,7 +20,9 @@ UPLOADS_PATH = "/mnt/session/uploads"
 MEMORY_PATH = "/mnt/memory/dreaming"
 # Where compaction saves the messages it replaces. DeepAgents fixes this name.
 HISTORY_PATH = "/conversation_history"
-READ_ONLY_PATHS = [f"{UPLOADS_PATH}/**", f"{HISTORY_PATH}/**"]
+# Where it moves a tool result out of a request the model refused as too long. DeepAgents fixes this name too.
+LARGE_RESULTS_PATH = "/large_tool_results"
+READ_ONLY_PATHS = [f"{UPLOADS_PATH}/**", f"{HISTORY_PATH}/**", f"{LARGE_RESULTS_PATH}/**"]
 
 # The official analyzer and organizer toolset: read, write, edit, glob and grep.
 TOOLS = ["read_file", "write_file", "edit_file", "glob", "grep"]
@@ -174,6 +176,9 @@ def run_agent(
                 f"{UPLOADS_PATH}/": ReadOnlyBackend(root_dir=transcripts, virtual_mode=True),
                 f"{MEMORY_PATH}/": MemoryBackend(root_dir=memory, virtual_mode=True),
                 f"{HISTORY_PATH}/": ReadOnlyBackend(root_dir=run_dir / HISTORY_PATH.lstrip("/"), virtual_mode=True),
+                f"{LARGE_RESULTS_PATH}/": ReadOnlyBackend(
+                    root_dir=run_dir / LARGE_RESULTS_PATH.lstrip("/"), virtual_mode=True
+                ),
             },
         )
         agent = create_agent(
@@ -190,7 +195,8 @@ def run_agent(
                 ),
                 SummarizationMiddleware(
                     model=chat_model.model_copy(update={"callbacks": [SummaryCallWatcher(run, model)]}),
-                    # Its own backend: only compaction may write the history, agents just read it back.
+                    # Its own backend: only compaction may write the history and the tool results it moves out,
+                    # agents just read them back.
                     backend=FilesystemBackend(root_dir=run_dir, virtual_mode=True),
                     # Absolute tokens, so the model's real window cannot rescale them. Setting that window to
                     # context_window instead would also shrink the middleware's hard limit by max_tokens.

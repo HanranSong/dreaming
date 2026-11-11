@@ -57,7 +57,8 @@ def write_report(path: Path, record: dict) -> None:
         f"- Estimated cost: {usd(_total_cost(agents))} at list price",
         "- Also in this folder: tool_calls.jsonl (each tool call an agent made), memory_before/ "
         "(memory as it was before this run, kept for the latest runs only) and, if an agent's context "
-        "was compacted, conversation_history/ (the messages compaction replaced)",
+        "was compacted, conversation_history/ (the messages compaction replaced) and large_tool_results/ "
+        "(tool results moved out of a request that was too long)",
         "",
         "## Sessions",
     ]

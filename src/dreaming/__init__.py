@@ -1,5 +1,6 @@
 """Dream over this project's Claude Code sessions into a local memory directory."""
 
+import fcntl
 import hashlib
 import json
 import os
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 from dreaming.agent import MEMORY_PATH, UPLOADS_PATH, AgentRun, run_agent
 from dreaming.render import render_text
 from dreaming.report import usd, write_report
-from dreaming.sessions import load_session, session_files
+from dreaming.sessions import load_session, log_stat, session_files
 
 DREAMING_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(DREAMING_DIR / ".env")  # values already set in the environment win
@@ -53,6 +54,7 @@ STATE_DIR = DREAMING_DIR / ".state"
 TRANSCRIPT_DIR = STATE_DIR / "transcripts"
 RUNS_DIR = STATE_DIR / "runs"
 STATE_FILE = STATE_DIR / "sessions.json"
+LOCK_FILE = STATE_DIR / "lock"
 LEGACY_PROCESSED_FILE = STATE_DIR / "processed.json"  # the first version's list of analyzed sessions
 PROMPT_DIR = Path(__file__).parent / "prompts"
 
@@ -78,7 +80,10 @@ def _prompt(name: str) -> str:
 def _load_state() -> dict:
     """Each session's status (running, done, failed or skipped) and whether memory still needs organizing."""
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        state = json.loads(STATE_FILE.read_text())
+        for entry in state["sessions"].values():
+            entry.pop("log_size", None)  # earlier versions kept the log's size where log_signature is now
+        return state
     state = {"sessions": {}, "organizer": {"pending": False, "attempts": 0}}
     if LEGACY_PROCESSED_FILE.exists():
         for session_id in json.loads(LEGACY_PROCESSED_FILE.read_text()):
@@ -147,18 +152,17 @@ def _digest(text: str | None) -> str | None:
     return None if text is None else hashlib.sha256(text.encode(errors="replace")).hexdigest()
 
 
-def _gained_content(path: Path, entry: dict) -> bool:
-    """Whether a finished session's conversation has changed since it was analyzed."""
-    size = path.stat().st_size
-    if entry.get("log_size") == size:
+def _gained_content(path: Path, entry: dict, signature: str) -> bool:
+    """Whether a finished session's conversation has changed since it was analyzed. signature is log_stat's."""
+    if entry.get("log_signature") == signature:  # no log file was touched, so the transcript is the same
         return False
     try:
         digest = _digest(_render(path)[1])
     except Exception:
         return False
     changed = "transcript_sha256" in entry and digest != entry["transcript_sha256"]
-    if not changed:  # only metadata grew, or the session predates these fields: this is the new baseline
-        entry.update(log_size=size, transcript_sha256=digest)
+    if not changed:  # only metadata changed, or the session predates these fields: this is the new baseline
+        entry.update(log_signature=signature, transcript_sha256=digest)
     return changed
 
 
@@ -193,6 +197,17 @@ def _analyze(path: Path, run_dir: Path) -> tuple[str, str | None, AgentRun | Non
 def main() -> None:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    # Two runs at once would analyze the same sessions and overwrite each other's memory and state. The system
+    # drops this lock when the process ends, however it ends, so a killed run never leaves it behind.
+    with LOCK_FILE.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"Another dreaming run is still working in {DREAMING_DIR}. Run again when it ends.")
+        _run()
+
+
+def _run() -> None:
     state = _load_state()
     sessions, organizer = state["sessions"], state["organizer"]
 
@@ -207,16 +222,20 @@ def main() -> None:
 
     cutoff = time.time() - SESSION_QUIET_SECONDS
     pending, not_run, resumed = [], [], set()
+    abandoned = False  # a session out of attempts is work left undone, so the run must not exit as a success
     for path in session_files(Path.cwd()):
         entry = sessions.get(path.stem, {})
+        # Both cover the subagent logs and saved tool outputs too: a transcript is built from all of them.
+        signature, changed_at = log_stat(path)
         finished = entry.get("status") in ("done", "skipped")
-        gained = finished and _gained_content(path, entry)
+        gained = finished and _gained_content(path, entry, signature)
         if finished and not gained:
             continue
         if not gained and entry.get("attempts", 0) >= MAX_ATTEMPTS:
             reason = f"gave up after {MAX_ATTEMPTS} failed attempts; last error: {entry.get('error')}"
             not_run.append((path.stem, reason))
-        elif path.stat().st_mtime >= cutoff:
+            abandoned = True
+        elif changed_at >= cutoff:
             not_run.append((path.stem, "waiting: its log changed in the last 30 minutes"))
         else:
             pending.append(path)
@@ -232,6 +251,8 @@ def main() -> None:
         if organizer_gave_up:
             print(f"Organizer gave up after {MAX_ATTEMPTS} failed attempts; last error: {organizer.get('error')}")
         print("Nothing to do.")
+        if abandoned or organizer_gave_up:
+            raise SystemExit(1)
         return
 
     run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -273,7 +294,7 @@ def main() -> None:
         print(f"[{number}/{len(pending)}] {path.stem}: ", end="", flush=True)
 
         memory_before = _files(MEMORY_DIR)
-        log_size = path.stat().st_size  # taken before reading, so anything appended meanwhile counts as new
+        signature = log_stat(path)[0]  # taken before reading, so anything appended meanwhile counts as new
         result["title"], digest, run = _analyze(path, run_dir)
         if run is None:
             entry["status"] = "skipped"
@@ -295,7 +316,7 @@ def main() -> None:
                 result["summary"] = run.text
                 print(f"done ({run.usage['requests']} requests, {usd(run.cost)})")
         if entry["status"] != "failed":
-            entry.update(log_size=log_size, transcript_sha256=digest)
+            entry.update(log_signature=signature, transcript_sha256=digest)
         result["status"] = entry["status"]
         checkpoint()
 
@@ -340,5 +361,5 @@ def main() -> None:
     _prune_backups()
     print(f"Report: {run_dir / 'report.md'}")
     statuses = [record["organizer"]["status"], *(session["status"] for session in record["sessions"])]
-    if "failed" in statuses:
+    if abandoned or "failed" in statuses or "gave up" in statuses:
         raise SystemExit(1)
