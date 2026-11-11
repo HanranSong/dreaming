@@ -44,7 +44,7 @@ def write_report(path: Path, record: dict) -> None:
         f"- Organizer: {organizer['status']}",
         f"- Estimated cost: {usd(_total_cost(agents))} at list price",
         "- Also in this folder: tool_calls.jsonl (each tool call an agent made) and memory_before/ "
-        "(memory as it was before this run)",
+        "(memory as it was before this run, kept for the latest runs only)",
         "",
         "## Sessions",
     ]

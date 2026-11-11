@@ -21,6 +21,8 @@ ORGANIZER_MODEL = "claude-haiku-5-5"
 SESSION_QUIET_SECONDS = 30 * 60
 # An agent that keeps failing after reaching the model is not retried forever: every try costs money.
 MAX_ATTEMPTS = 3
+# Rolling back only ever needs a recent copy of memory. Reports and tool logs are kept for every run.
+BACKUPS_TO_KEEP = 5
 
 DREAMING_DIR = Path(__file__).resolve().parents[2]
 MEMORY_DIR = DREAMING_DIR / "memory"
@@ -101,6 +103,12 @@ def _remove_stubs() -> int:
     for path in stubs:
         path.unlink()
     return len(stubs)
+
+
+def _prune_backups() -> None:
+    # Run folders are named by start time, so sorting by path puts the oldest first.
+    for backup in sorted(RUNS_DIR.glob("*/memory_before"))[:-BACKUPS_TO_KEEP]:
+        shutil.rmtree(backup)
 
 
 def _render(path: Path) -> tuple[str, str | None]:
@@ -278,6 +286,7 @@ def main() -> None:
 
     record["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
     checkpoint()
+    _prune_backups()
     print(f"Report: {run_dir / 'report.md'}")
     statuses = [record["organizer"]["status"], *(session["status"] for session in record["sessions"])]
     if "failed" in statuses:
