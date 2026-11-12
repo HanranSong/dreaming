@@ -1,4 +1,4 @@
-"""Dream over this project's Claude Code sessions into a local memory directory."""
+"""Dream over this project's Claude Code and Codex sessions into a local memory directory."""
 
 import fcntl
 import hashlib
@@ -9,13 +9,17 @@ import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
+from typing import NamedTuple
 
 from dotenv import load_dotenv
 
+from dreaming import codex
+from dreaming import sessions as claude_code
 from dreaming.agent import MEMORY_PATH, UPLOADS_PATH, AgentRun, run_agent
 from dreaming.render import render_text
 from dreaming.report import usd, write_report
-from dreaming.sessions import load_session, log_stat, session_files, without_times
+from dreaming.sessions import without_times
 
 DREAMING_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(DREAMING_DIR / ".env")  # values already set in the environment win
@@ -42,7 +46,7 @@ ANALYZER_CONTEXT_WINDOW = _whole_number("DREAMING_ANALYZER_CONTEXT_WINDOW", 1000
 ORGANIZER_CONTEXT_WINDOW = _whole_number("DREAMING_ORGANIZER_CONTEXT_WINDOW", 1000)
 COMPACT_AT_PERCENT = _whole_number("DREAMING_COMPACT_AT_PERCENT", 11, 100) or 85
 
-# Claude Code logs have no "finished" marker, so a session counts as finished once its log goes quiet.
+# Neither tool's logs have a "finished" marker, so a session counts as finished once its log goes quiet.
 SESSION_QUIET_SECONDS = 30 * 60
 # An agent that keeps failing after reaching the model is not retried forever: every try costs money.
 MAX_ATTEMPTS = 3
@@ -70,6 +74,24 @@ ANALYZER_TASK = (
 ORGANIZER_TASK = "Every analyzer has finished. Organize the memory directory at {memory}."
 
 INTERRUPTED = "interrupted: the run stopped before this session finished"
+
+
+class Session(NamedTuple):
+    """One session's log and the module that reads it: sessions.py for Claude Code's, codex.py for Codex's."""
+
+    id: str
+    path: Path
+    reader: ModuleType
+
+
+def _project_sessions(project: Path) -> list[Session]:
+    """The sessions both tools ran in this project as one timeline, earliest session first."""
+    found = [
+        Session(reader.session_id(path), path, reader)
+        for reader in (claude_code, codex)
+        for path in reader.session_files(project)
+    ]
+    return sorted(found, key=lambda session: session.reader.started_at(session.path))
 
 
 def _prompt(name: str) -> str:
@@ -139,13 +161,13 @@ def _prune_backups() -> None:
         shutil.rmtree(backup)
 
 
-def _render(path: Path) -> tuple[str, str | None, str | None]:
+def _render(session: Session) -> tuple[str, str | None, str | None]:
     """A session's title, transcript text and digest. The last two are None when it has no conversation.
 
     The digest leaves the transcript's time lines out. It tells whether the conversation changed, and it stays
     what it was for sessions analyzed before transcripts had those lines.
     """
-    export = load_session(path)
+    export = session.reader.load_session(session.path)
     title = export["session"]["title"]
     if not any(thread["events"] for thread in export["threads"]):
         return title, None, None
@@ -153,12 +175,12 @@ def _render(path: Path) -> tuple[str, str | None, str | None]:
     return title, render_text(export), hashlib.sha256(untimed.encode(errors="replace")).hexdigest()
 
 
-def _gained_content(path: Path, entry: dict, signature: str) -> bool:
+def _gained_content(session: Session, entry: dict, signature: str) -> bool:
     """Whether a finished session's conversation has changed since it was analyzed. signature is log_stat's."""
     if entry.get("log_signature") == signature:  # no log file was touched, so the transcript is the same
         return False
     try:
-        digest = _render(path)[2]
+        digest = _render(session)[2]
     except Exception:
         return False
     changed = "transcript_sha256" in entry and digest != entry["transcript_sha256"]
@@ -167,18 +189,18 @@ def _gained_content(path: Path, entry: dict, signature: str) -> bool:
     return changed
 
 
-def _analyze(path: Path, run_dir: Path) -> tuple[str, str | None, AgentRun | None]:
+def _analyze(session: Session, run_dir: Path) -> tuple[str, str | None, AgentRun | None]:
     """Analyze one session. Returns its title, transcript digest and the agent's run (None if no conversation)."""
     try:
-        title, text, digest = _render(path)
+        title, text, digest = _render(session)
         if text is None:
             return title, None, None
-        (TRANSCRIPT_DIR / f"{path.stem}.txt").write_text(text, encoding="utf-8")
+        (TRANSCRIPT_DIR / f"{session.id}.txt").write_text(text, encoding="utf-8")
     except Exception as error:
         return "", None, AgentRun(error=f"could not read the session log: {error!r}")
-    task = ANALYZER_TASK.format(path=f"{UPLOADS_PATH}/{path.stem}.txt", memory=MEMORY_PATH)
+    task = ANALYZER_TASK.format(path=f"{UPLOADS_PATH}/{session.id}.txt", memory=MEMORY_PATH)
     system = _prompt("analyzer_system.md")
-    label = f"analyzer {path.stem}"
+    label = f"analyzer {session.id}"
     run = run_agent(
         ANALYZER_MODEL,
         ANALYZER_EFFORT,
@@ -224,24 +246,24 @@ def _run() -> None:
     cutoff = time.time() - SESSION_QUIET_SECONDS
     pending, not_run, resumed = [], [], set()
     abandoned = False  # a session out of attempts is work left undone, so the run must not exit as a success
-    for path in session_files(Path.cwd()):
-        entry = sessions.get(path.stem, {})
+    for session in _project_sessions(Path.cwd()):
+        entry = sessions.get(session.id, {})
         # Both cover the subagent logs and saved tool outputs too: a transcript is built from all of them.
-        signature, changed_at = log_stat(path)
+        signature, changed_at = session.reader.log_stat(session.path)
         finished = entry.get("status") in ("done", "skipped")
-        gained = finished and _gained_content(path, entry, signature)
+        gained = finished and _gained_content(session, entry, signature)
         if finished and not gained:
             continue
         if not gained and entry.get("attempts", 0) >= MAX_ATTEMPTS:
             reason = f"gave up after {MAX_ATTEMPTS} failed attempts; last error: {entry.get('error')}"
-            not_run.append((path.stem, reason))
+            not_run.append((session.id, reason))
             abandoned = True
         elif changed_at >= cutoff:
-            not_run.append((path.stem, "waiting: its log changed in the last 30 minutes"))
+            not_run.append((session.id, "waiting: its log changed in the last 30 minutes"))
         else:
-            pending.append(path)
+            pending.append(session)
             if gained:  # new content gets a fresh set of attempts
-                resumed.add(path.stem)
+                resumed.add(session.id)
                 entry["attempts"] = 0
     _save_state(state)
     for session_id, reason in not_run:
@@ -284,25 +306,27 @@ def _run() -> None:
         write_report(run_dir / "report.md", record)
 
     print(f"Run {run_id}: {len(pending)} session(s) to analyze.")
-    for number, path in enumerate(pending, 1):
-        entry = sessions.setdefault(path.stem, {"attempts": 0})
-        result = {"id": path.stem, "status": "running", "previous_error": entry.pop("error", None)}
-        if path.stem in resumed:
+    for number, session in enumerate(pending, 1):
+        source = session.reader.SOURCE
+        entry = sessions.setdefault(session.id, {"attempts": 0})
+        result = {"id": session.id, "source": source, "status": "running", "previous_error": entry.pop("error", None)}
+        if session.id in resumed:
             result["note"] = "Analyzed again: the conversation changed after its last analysis."
         record["sessions"].append(result)
-        entry.update(status="running", last_run=run_id)
+        entry.update(status="running", last_run=run_id, source=source)
         checkpoint()
-        print(f"[{number}/{len(pending)}] {path.stem}: ", end="", flush=True)
+        print(f"[{number}/{len(pending)}] {source} {session.id}: ", end="", flush=True)
 
         memory_before = _files(MEMORY_DIR)
-        signature = log_stat(path)[0]  # taken before reading, so anything appended meanwhile counts as new
-        result["title"], digest, run = _analyze(path, run_dir)
+        # Taken before reading, so anything appended meanwhile counts as new.
+        signature = session.reader.log_stat(session.path)[0]
+        result["title"], digest, run = _analyze(session, run_dir)
         if run is None:
             entry["status"] = "skipped"
             result["note"] = "No conversation in this session."
             print("skipped (no conversation)")
         else:
-            record["agents"].append((f"analyzer {path.stem[:8]}", run))
+            record["agents"].append((f"analyzer {session.id[:8]}", run))
             entry["status"] = "failed" if run.error else "done"
             if run.usage["requests"]:  # a try that reached the model cost money, so it counts
                 entry["attempts"] += 1

@@ -1,4 +1,4 @@
-"""Read Claude Code session logs into the export shape render.py expects."""
+"""Read Claude Code session logs into the export shape render.py expects. codex.py does the same for Codex's."""
 
 import hashlib
 import json
@@ -13,6 +13,8 @@ PERSISTED_OUTPUT = re.compile(
 # "EVENT message.time:" line above the message, which is how the analyzer prompt describes it.
 TIME_EVENT = "message.time"
 
+SOURCE = "claude-code"
+
 
 def _records(path: Path):
     with path.open(encoding="utf-8") as lines:
@@ -23,7 +25,7 @@ def _records(path: Path):
                 continue  # a session still being written can end in a partial line
 
 
-def _started_at(path: Path) -> str:
+def started_at(path: Path) -> str:
     """The log's first message time. These are UTC ISO timestamps, so they sort as strings."""
     for record in _records(path):
         if record.get("type") in ("user", "assistant"):
@@ -34,25 +36,34 @@ def _started_at(path: Path) -> str:
 def session_files(project_root: Path) -> list[Path]:
     """The session logs Claude Code keeps for this project, earliest session first."""
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(project_root))
-    return sorted((Path.home() / ".claude" / "projects" / slug).glob("*.jsonl"), key=_started_at)
+    return sorted((Path.home() / ".claude" / "projects" / slug).glob("*.jsonl"), key=started_at)
 
 
-def log_stat(path: Path) -> tuple[str, float]:
+def session_id(path: Path) -> str:
+    return path.stem
+
+
+def files_stat(files: list[Path], folder: Path) -> tuple[str, float]:
     """A signature of the files a session's transcript is read from, and when the newest of them changed.
 
-    These are the session log, its subagents' logs and the tool outputs saved beside them. The signature is
-    a hash of each one's name, size and modification time, so it changes when any of them is added, removed
-    or written to, even if the sizes still add up to the same total.
+    The signature is a hash of each one's path under folder, size and modification time, so it changes when
+    any of them is added, removed or written to, even if the sizes still add up to the same total.
     """
-    session_dir = path.with_suffix("")
-    files = sorted([path, *session_dir.glob("subagents/**/agent-*"), *session_dir.glob("tool-results/*")])
+    files = sorted(files)
     stats = [file.stat() for file in files]
     lines = [
-        f"{file.relative_to(path.parent)} {stat.st_size} {stat.st_mtime_ns}"
+        f"{file.relative_to(folder)} {stat.st_size} {stat.st_mtime_ns}"
         for file, stat in zip(files, stats, strict=True)
     ]
     signature = hashlib.sha256("\n".join(lines).encode(errors="replace")).hexdigest()
     return signature, max(stat.st_mtime for stat in stats)
+
+
+def log_stat(path: Path) -> tuple[str, float]:
+    """files_stat of the session log, its subagents' logs and the tool outputs saved beside them."""
+    session_dir = path.with_suffix("")
+    files = [path, *session_dir.glob("subagents/**/agent-*"), *session_dir.glob("tool-results/*")]
+    return files_stat(files, path.parent)
 
 
 def _full_result(content, session_dir: Path):
@@ -114,7 +125,7 @@ def _log_events(path: Path, session_dir: Path) -> list[dict]:
 def _subagent_threads(session_dir: Path) -> list[dict]:
     """Subagents log to their own files, under subagents/ directly or in a workflow's folder."""
     threads = []
-    for log in sorted(session_dir.glob("subagents/**/agent-*.jsonl"), key=_started_at):
+    for log in sorted(session_dir.glob("subagents/**/agent-*.jsonl"), key=started_at):
         meta_file = log.with_suffix(".meta.json")
         meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
         threads.append(
@@ -147,11 +158,11 @@ def load_session(path: Path) -> dict:
     primary = {
         "id": "primary",
         "parent_thread_id": None,
-        "agent_name": "claude-code",
+        "agent_name": SOURCE,
         "events": _log_events(path, session_dir),
     }
     return {
-        "session": {"id": path.stem, "title": title, "created_at": _started_at(path)},
-        "agent": {"name": "claude-code"},
+        "session": {"id": path.stem, "title": title, "created_at": started_at(path)},
+        "agent": {"name": SOURCE},
         "threads": [primary, *_subagent_threads(session_dir)],
     }

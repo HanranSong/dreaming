@@ -63,7 +63,7 @@ def write_report(path: Path, record: dict) -> None:
         "## Sessions",
     ]
     for session in sessions:
-        lines += ["", f"### {session['id']}: {session['status']}"]
+        lines += ["", f"### {session['id']}: {session['status']}", f"- Source: {session['source']}"]
         if session.get("title"):
             lines.append(f"- Title: {' '.join(session['title'].split())}")
         if session.get("previous_error"):
