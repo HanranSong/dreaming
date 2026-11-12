@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import sys
 from compression import zstd
 from functools import cache
 from pathlib import Path
@@ -39,8 +40,14 @@ BOOKKEEPING = {
     "encrypted_content",
     "internal_chat_message_metadata_passthrough",
 }
-# Text Codex puts in the user's turn itself, such as <environment_context>: one tag around the whole block.
-INJECTED = re.compile(r"<([A-Za-z_][\w-]*)>.*</\1>", re.DOTALL)
+# Text Codex puts in the user's turn itself: one of its own tags around the whole block. Only the tags named
+# here count, so a request the user wrote inside a tag of their own is kept. A tag Codex adds later shows up
+# in transcripts as a user message until it is named here.
+INJECTED = re.compile(
+    r"<(environment_context|user_instructions|user_shell_command|turn_aborted|subagent_notification|skill"
+    r"|external_\w+)>.*</\1>",
+    re.DOTALL,
+)
 
 
 def _home() -> Path:
@@ -90,12 +97,19 @@ def _threads() -> dict[Path, dict]:
     home = _home()
     logs = [*home.glob("sessions/**/rollout-*"), *home.glob("archived_sessions/**/rollout-*")]
     threads = {}
-    for log in logs:
+    for log in sorted(logs, key=lambda log: log.stat().st_mtime):
         if log.suffix not in (".jsonl", ".zst"):
             continue
-        first = next(_records(log), None)
+        try:
+            first = next(_records(log), None)
+        except Exception as error:  # one broken log, of any project, must not hide every other session
+            print(f"Left out a Codex log that could not be read: {log}: {error!r}", file=sys.stderr)
+            continue
         meta = first.get("payload") if isinstance(first, dict) and first.get("type") == "session_meta" else None
-        if isinstance(meta, dict) and meta.get("id") and not _internal(meta):
+        # The id names the transcript file, so only a plain one is taken.
+        if isinstance(meta, dict) and re.fullmatch(r"[\w-]+", str(meta.get("id"))) and not _internal(meta):
+            # A thread with two logs, such as a live one and an archived one, is read from the newer.
+            threads = {other: has for other, has in threads.items() if has["id"] != meta["id"]}
             threads[log] = meta
     return dict(sorted(threads.items(), key=lambda item: item[1].get("timestamp") or ""))
 

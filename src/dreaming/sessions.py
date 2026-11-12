@@ -33,10 +33,17 @@ def started_at(path: Path) -> str:
     return ""
 
 
+def _started_in(path: Path) -> str | None:
+    """The folder the session was started in, if the log says."""
+    return next((record["cwd"] for record in _records(path) if record.get("cwd")), None)
+
+
 def session_files(project_root: Path) -> list[Path]:
     """The session logs Claude Code keeps for this project, earliest session first."""
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(project_root))
-    return sorted((Path.home() / ".claude" / "projects" / slug).glob("*.jsonl"), key=started_at)
+    logs = (Path.home() / ".claude" / "projects" / slug).glob("*.jsonl")
+    # Two folders can share a slug, /a-b and /a/b for one, so each log is checked for the folder it names.
+    return sorted((log for log in logs if _started_in(log) in (None, str(project_root))), key=started_at)
 
 
 def session_id(path: Path) -> str:
@@ -73,8 +80,13 @@ def _full_result(content, session_dir: Path):
         if saved.is_file():
             return saved.read_text(encoding="utf-8", errors="replace")
     if isinstance(content, list):
-        # Base64 images would otherwise be rendered into the transcript as text.
-        return [block for block in content if block.get("type") != "image"]
+        # Base64 images would otherwise be rendered into the transcript as text. A text block can hold a
+        # preview too.
+        return [
+            {**block, "text": _full_result(block["text"], session_dir)} if isinstance(block.get("text"), str) else block
+            for block in content
+            if block.get("type") != "image"
+        ]
     return content
 
 

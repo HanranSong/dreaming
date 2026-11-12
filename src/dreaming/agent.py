@@ -1,6 +1,7 @@
 """Run one dreaming agent. This is the only module that imports LangChain or DeepAgents."""
 
 import json
+import posixpath
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -80,12 +81,19 @@ class ReadOnlyBackend(FilesystemBackend):
         return EditResult(error=f"Error: {file_path} is read-only")
 
 
+# Files Claude Code and Codex load as instructions from any folder they work in. A session's text must never
+# become one by way of memory.
+INSTRUCTION_FILES = {"claude.md", "claude.local.md", "agents.md", "agents.override.md"}
+
+
 class MemoryBackend(FilesystemBackend):
     """Keeps memory to Markdown pages: agents have no delete tool, so a stray file would stay forever."""
 
     def write(self, file_path: str, content: str, *args, **kwargs) -> WriteResult:
         if not file_path.endswith(".md"):
             return WriteResult(error=f"Error: memory files must end in .md: {file_path}")
+        if file_path.rsplit("/", 1)[-1].lower() in INSTRUCTION_FILES:
+            return WriteResult(error=f"Error: a memory file cannot have this name: {file_path}")
         return super().write(file_path, content, *args, **kwargs)
 
 
@@ -97,6 +105,7 @@ class AgentRun:
     error: str | None = None
     usage: Counter = field(default_factory=Counter)
     cost: float | None = None  # estimated US dollars; None when the model has no entry in PRICES
+    read: set = field(default_factory=set)  # the paths of the files it read
 
 
 def _count_usage(run: AgentRun, model: str, metadata: dict) -> None:
@@ -266,7 +275,12 @@ def run_agent(
                     if message.usage_metadata:
                         _count_usage(run, model, message.usage_metadata)
                 elif message.type == "tool":
-                    _log_tool_call(tool_log, label, calls.get(message.tool_call_id, {}), message)
+                    call = calls.get(message.tool_call_id, {})
+                    _log_tool_call(tool_log, label, call, message)
+                    # A refused or failed read can also come back as a normal result that starts with "Error".
+                    failed = message.status == "error" or str(message.text).startswith("Error")
+                    if call.get("name") == "read_file" and not failed:
+                        run.read.add(posixpath.normpath("/" + str(call.get("args", {}).get("file_path")).lstrip("/")))
             messages = state["messages"]
 
         stop_reason = _stop_reason(messages[-1])

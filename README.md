@@ -21,6 +21,8 @@ To install uv on a new machine:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+Then open a new terminal, so that the `uv` command is found.
+
 ## Set up in a project
 
 Dreaming lives in a `dreaming/` folder inside each project that uses it, and keeps that project's memory there.
@@ -34,8 +36,11 @@ uv sync --project dreaming
 
 Then:
 
-1. Open `dreaming/.env` and fill in `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. The other settings can stay
-   empty. The comments in that file explain each one.
+1. Open `dreaming/.env` and fill in your key. The comments in that file explain each setting.
+   - With an Anthropic key: fill in `ANTHROPIC_API_KEY`. The other settings can stay empty.
+   - With an OpenAI key: fill in `OPENAI_API_KEY`, and set both `DREAMING_ANALYZER_MODEL` and
+     `DREAMING_ORGANIZER_MODEL` to an OpenAI model such as `gpt-6-luna`. Left empty, they use a Claude model,
+     which needs an Anthropic key.
 2. If the project is a git repository, add `dreaming/` to its `.gitignore`. The folder is a git repository of
    its own and holds your API key.
 
@@ -59,7 +64,7 @@ analysis. Run it again whenever you like: sessions that are already done cost no
 | `Not run <id>: waiting` | The session's log changed in the last 30 minutes, so it may still be in use. Run again later. |
 | `failed` | The session is retried on the next run, up to 3 attempts. |
 
-Every run calls the model and costs money. The cost of each agent is in the run's report.
+A run that analyzes a session calls the model and costs money. The cost of each agent is in the run's report.
 
 ### What a run writes
 
@@ -140,7 +145,8 @@ against the code before you rely on it. Do not edit this folder.
 
 - **Codex** reads `AGENTS.md` at the start of every session.
 - **Claude Code** reads `AGENTS.md` only when the project has no `CLAUDE.md`, and only from version 2.1.277.
-  If the project has a `CLAUDE.md`, add this line to it, outside any code block:
+  What works in every case is a `CLAUDE.md` in the project's root folder with this line in it, outside any
+  code block:
 
   ```markdown
   @AGENTS.md

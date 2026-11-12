@@ -1,6 +1,7 @@
 """Run dreaming every day at a set time: a crontab line where cron is installed, a systemd user timer elsewhere.
 
-One dreaming folder has at most one schedule. It runs the same program a run by hand does, from the project's
+One dreaming folder has at most one schedule. Which of the two a machine offers can change, when cron is
+installed or removed, so turning a schedule off and looking for one always cover both. It runs the same program a run by hand does, from the project's
 folder, and adds what that prints to a log.
 """
 
@@ -38,12 +39,12 @@ def _program() -> Path:
     return program
 
 
-def _backend() -> str:
-    if shutil.which("crontab"):
-        return "cron"
-    if shutil.which("systemctl"):
-        return "systemd"
-    raise SystemExit("Cannot schedule: this machine has neither crontab nor systemctl.")
+def _backends() -> list[str]:
+    """The schedulers this machine has, the one a new schedule goes to first."""
+    found = [name for name, command in (("cron", "crontab"), ("systemd", "systemctl")) if shutil.which(command)]
+    if not found:
+        raise SystemExit("Cannot schedule: this machine has neither crontab nor systemctl.")
+    return found
 
 
 def _call(*command: str, text: str | None = None) -> None:
@@ -120,8 +121,9 @@ def _systemd_off(dreaming_dir: Path) -> bool:
     service, timer = _units(dreaming_dir)
     if not (service.exists() or timer.exists()):
         return False
-    # The timer may never have started, so a failure to stop it is not one to report.
-    subprocess.run(["systemctl", "--user", "disable", "--now", timer.name], capture_output=True)
+    # Stopped before its files go: a timer systemd could not be told to stop would go on firing unseen.
+    if timer.exists():
+        _call("systemctl", "--user", "disable", "--now", timer.name)
     service.unlink(missing_ok=True)
     timer.unlink(missing_ok=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
@@ -131,6 +133,7 @@ def _systemd_off(dreaming_dir: Path) -> bool:
 def _systemd_on(dreaming_dir: Path, project: Path, program: Path, log: Path, hour: int, minute: int) -> None:
     service, timer = _units(dreaming_dir)
     service.parent.mkdir(parents=True, exist_ok=True)
+    before = {unit: unit.read_text(encoding="utf-8") if unit.exists() else None for unit in (service, timer)}
     service.write_text(
         "[Unit]\n"
         f"Description=Dreaming over {_unit_text(str(project))}\n\n"
@@ -158,13 +161,20 @@ def _systemd_on(dreaming_dir: Path, project: Path, program: Path, log: Path, hou
         _call("systemctl", "--user", "daemon-reload")
         _call("systemctl", "--user", "enable", "--now", timer.name)
     except SystemExit:
-        _systemd_off(dreaming_dir)  # leave no files that would read as a schedule that is on
+        # Back to the files as they were: the schedule that was on stays, and no new files are left behind
+        # to read as one that is.
+        for unit, text in before.items():
+            unit.unlink() if text is None else unit.write_text(text, encoding="utf-8")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
         raise
 
 
 def _systemd_status(dreaming_dir: Path) -> Schedule | None:
     service, timer = _units(dreaming_dir)
     if not (service.exists() and timer.exists()):
+        return None
+    enabled = subprocess.run(["systemctl", "--user", "is-enabled", timer.name], capture_output=True, text=True)
+    if enabled.stdout.strip() == "disabled":  # the files alone are not a schedule
         return None
     time = re.search(r"^OnCalendar=\S+ (\d\d:\d\d):", timer.read_text(encoding="utf-8"), re.MULTILINE)
     project = re.search(r"^WorkingDirectory=(.*)$", service.read_text(encoding="utf-8"), re.MULTILINE)
@@ -189,17 +199,20 @@ def _linger_note() -> str:
 
 
 def status(dreaming_dir: Path) -> Schedule | None:
-    return _cron_status(dreaming_dir) if _backend() == "cron" else _systemd_status(dreaming_dir)
+    found = [(_cron_status if backend == "cron" else _systemd_status)(dreaming_dir) for backend in _backends()]
+    return next((schedule for schedule in found if schedule), None)
 
 
 def turn_on(dreaming_dir: Path, project: Path, log: Path, at: str | None) -> str:
     """Schedule a daily run over project, replacing this dreaming folder's schedule if it has one."""
     hour, minute = _clock(at or DEFAULT_TIME)
-    program, backend = _program(), _backend()
+    program, backend = _program(), _backends()[0]
     log.parent.mkdir(parents=True, exist_ok=True)
     note = ""
     if backend == "cron":
         _cron_on(dreaming_dir, project, program, log, hour, minute)
+        if shutil.which("systemctl"):
+            _systemd_off(dreaming_dir)  # one made before this machine had cron
     else:
         _systemd_on(dreaming_dir, project, program, log, hour, minute)
         note = _linger_note()
@@ -211,8 +224,8 @@ def turn_on(dreaming_dir: Path, project: Path, log: Path, at: str | None) -> str
 
 
 def turn_off(dreaming_dir: Path) -> str:
-    removed = _cron_off(dreaming_dir) if _backend() == "cron" else _systemd_off(dreaming_dir)
-    return "Schedule off." if removed else "Schedule off: there was none."
+    removed = [(_cron_off if backend == "cron" else _systemd_off)(dreaming_dir) for backend in _backends()]
+    return "Schedule off." if any(removed) else "Schedule off: there was none."
 
 
 def describe(dreaming_dir: Path, log: Path) -> str:

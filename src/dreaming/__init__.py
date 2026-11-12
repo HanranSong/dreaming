@@ -7,8 +7,10 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import NamedTuple
@@ -42,10 +44,21 @@ ANALYZER_MODEL = os.getenv("DREAMING_ANALYZER_MODEL") or "claude-haiku-5-5"
 ORGANIZER_MODEL = os.getenv("DREAMING_ORGANIZER_MODEL") or "claude-haiku-5-5"
 ANALYZER_EFFORT = os.getenv("DREAMING_ANALYZER_EFFORT") or "medium"
 ORGANIZER_EFFORT = os.getenv("DREAMING_ORGANIZER_EFFORT") or "medium"
-# An empty context window uses the model's own. The percent stays above 10 because compaction keeps the latest 10%.
-ANALYZER_CONTEXT_WINDOW = _whole_number("DREAMING_ANALYZER_CONTEXT_WINDOW", 1000)
-ORGANIZER_CONTEXT_WINDOW = _whole_number("DREAMING_ORGANIZER_CONTEXT_WINDOW", 1000)
-COMPACT_AT_PERCENT = _whole_number("DREAMING_COMPACT_AT_PERCENT", 11, 100) or 85
+
+
+@cache
+def _compaction() -> tuple[int | None, int | None, int]:
+    """The analyzer's and the organizer's context window, and the percent of it to compact at.
+
+    An empty context window uses the model's own. The percent stays above 10 because compaction keeps the
+    latest 10%. Read when a run starts rather than on import, so a bad value does not stop undo or schedule.
+    """
+    return (
+        _whole_number("DREAMING_ANALYZER_CONTEXT_WINDOW", 1000),
+        _whole_number("DREAMING_ORGANIZER_CONTEXT_WINDOW", 1000),
+        _whole_number("DREAMING_COMPACT_AT_PERCENT", 11, 100) or 85,
+    )
+
 
 # Neither tool's logs have a "finished" marker, so a session counts as finished once its log goes quiet.
 SESSION_QUIET_SECONDS = 30 * 60
@@ -64,6 +77,8 @@ SCHEDULE_LOG = STATE_DIR / "schedule.log"
 # Each run folder's copies of memory and of the state file from before the run: what undo puts back.
 MEMORY_BEFORE = "memory_before"
 STATE_BEFORE = "sessions_before.json"
+# Names the backup an undo is putting back, from before it starts until it is done.
+RESTORE_FILE = STATE_DIR / "restore.json"
 LEGACY_PROCESSED_FILE = STATE_DIR / "processed.json"  # the first version's list of analyzed sessions
 PROMPT_DIR = Path(__file__).parent / "prompts"
 
@@ -161,30 +176,76 @@ def _remove_stubs() -> int:
 
 
 def _back_up(run_dir: Path) -> None:
-    """Copy memory and the state file as they are now into a run's folder, for undo to put back."""
+    """Copy memory and the state file as they are now into a run's folder, for undo to put back.
+
+    The state file is copied last, so a backup that has it is a whole one.
+    """
     shutil.copytree(MEMORY_DIR, run_dir / MEMORY_BEFORE)
     shutil.copy(STATE_FILE, run_dir / STATE_BEFORE)
 
 
 def _prune_backups() -> None:
     # Run folders are named by start time, so sorting by path puts the oldest first.
-    for backup in sorted(RUNS_DIR.glob(f"*/{MEMORY_BEFORE}"))[:-BACKUPS_TO_KEEP]:
-        shutil.rmtree(backup)
-        (backup.parent / STATE_BEFORE).unlink(missing_ok=True)
+    whole = sorted(RUNS_DIR.glob(f"*/{STATE_BEFORE}"))
+    kept = {backup.parent for backup in whole[-BACKUPS_TO_KEEP:]}
+    # A backup cut short has no state file. It cannot be put back, so it is removed and never counted.
+    for backup in RUNS_DIR.glob(f"*/{MEMORY_BEFORE}"):
+        if backup.parent not in kept:
+            (backup.parent / STATE_BEFORE).unlink(missing_ok=True)
+            shutil.rmtree(backup)
+
+
+def _has_backup(run_dir: Path) -> bool:
+    return (run_dir / MEMORY_BEFORE).is_dir() and (run_dir / STATE_BEFORE).is_file()
+
+
+def _restore(backup: Path) -> None:
+    """Put a run folder's backup of memory and the state file back.
+
+    RESTORE_FILE is there from start to end, so an undo killed part-way is done again from the top by the
+    next start, and memory and the state file never stay out of step.
+    """
+    RESTORE_FILE.write_text(json.dumps(backup.name))
+    fresh = STATE_DIR / "memory.restoring"
+    shutil.rmtree(fresh, ignore_errors=True)
+    shutil.copytree(backup / MEMORY_BEFORE, fresh)  # memory is only replaced once its copy is whole
+    shutil.rmtree(MEMORY_DIR, ignore_errors=True)
+    fresh.replace(MEMORY_DIR)
+    _save_state(json.loads((backup / STATE_BEFORE).read_text()))
+    RESTORE_FILE.unlink()
+
+
+def _finish_restore() -> None:
+    if not RESTORE_FILE.exists():
+        return
+    backup = RUNS_DIR / json.loads(RESTORE_FILE.read_text())
+    if not _has_backup(backup):
+        raise SystemExit(
+            f"An undo was interrupted and its backup in {backup} is gone, so memory may be incomplete. "
+            f"Check {MEMORY_DIR} and {STATE_FILE}, then delete {RESTORE_FILE}."
+        )
+    _restore(backup)
+    print(f"Finished an interrupted undo: memory and session state are back to before run {backup.name}.")
+
+
+def _digest(export: dict, *, titled: bool = False) -> str | None:
+    """A digest that tells whether a session's conversation changed. None when it has no conversation.
+
+    It leaves out the transcript's time lines and the session's title, which the tool can change long after
+    the conversation ended. titled gives the digest earlier versions stored, which had the title in it.
+    """
+    if not any(thread["events"] for thread in export["threads"]):
+        return None
+    if not titled:
+        export = {**export, "session": {**export["session"], "title": ""}}
+    return hashlib.sha256(render_text(without_times(export)).encode(errors="replace")).hexdigest()
 
 
 def _render(session: Session) -> tuple[str, str | None, str | None]:
-    """A session's title, transcript text and digest. The last two are None when it has no conversation.
-
-    The digest leaves the transcript's time lines out. It tells whether the conversation changed, and it stays
-    what it was for sessions analyzed before transcripts had those lines.
-    """
+    """A session's title, transcript text and digest. The last two are None when it has no conversation."""
     export = session.reader.load_session(session.path)
-    title = export["session"]["title"]
-    if not any(thread["events"] for thread in export["threads"]):
-        return title, None, None
-    untimed = render_text(without_times(export))
-    return title, render_text(export), hashlib.sha256(untimed.encode(errors="replace")).hexdigest()
+    digest = _digest(export)
+    return export["session"]["title"], render_text(export) if digest else None, digest
 
 
 def _gained_content(session: Session, entry: dict, signature: str) -> bool:
@@ -192,10 +253,13 @@ def _gained_content(session: Session, entry: dict, signature: str) -> bool:
     if entry.get("log_signature") == signature:  # no log file was touched, so the transcript is the same
         return False
     try:
-        digest = _render(session)[2]
-    except Exception:
+        export = session.reader.load_session(session.path)
+        digests = (_digest(export), _digest(export, titled=True))
+    except Exception as error:  # not known, so nothing is recorded and the next run checks again
+        print(f"Could not check {session.id} for new content: {error!r}", file=sys.stderr)
         return False
-    changed = "transcript_sha256" in entry and digest != entry["transcript_sha256"]
+    digest = digests[0]
+    changed = "transcript_sha256" in entry and entry["transcript_sha256"] not in digests
     if not changed:  # only metadata changed, or the session predates these fields: this is the new baseline
         entry.update(log_signature=signature, transcript_sha256=digest)
     return changed
@@ -210,7 +274,9 @@ def _analyze(session: Session, run_dir: Path) -> tuple[str, str | None, AgentRun
         (TRANSCRIPT_DIR / f"{session.id}.txt").write_text(text, encoding="utf-8")
     except Exception as error:
         return "", None, AgentRun(error=f"could not read the session log: {error!r}")
-    task = ANALYZER_TASK.format(path=f"{UPLOADS_PATH}/{session.id}.txt", memory=MEMORY_PATH)
+    transcript = f"{UPLOADS_PATH}/{session.id}.txt"
+    task = ANALYZER_TASK.format(path=transcript, memory=MEMORY_PATH)
+    window, _, compact_at_percent = _compaction()
     system = _prompt("analyzer_system.md")
     label = f"analyzer {session.id}"
     run = run_agent(
@@ -222,10 +288,13 @@ def _analyze(session: Session, run_dir: Path) -> tuple[str, str | None, AgentRun
         MEMORY_DIR,
         run_dir,
         label,
-        ANALYZER_CONTEXT_WINDOW,
-        COMPACT_AT_PERCENT,
+        window,
+        compact_at_percent,
         _prompt("analyzer_compaction.md"),
     )
+    # A model can end its turn having done nothing, and a session it never read must not count as analyzed.
+    if not run.error and transcript not in run.read:
+        run.error = "the agent finished without reading the transcript"
     return title, digest, run
 
 
@@ -282,6 +351,7 @@ def main() -> None:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit(f"Another dreaming run is still working in {DREAMING_DIR}. Run again when it ends.")
+        _finish_restore()
         if arguments.command == "undo":
             _undo(arguments.run)
         else:
@@ -302,7 +372,7 @@ def _undo(run_id: str | None) -> None:
             f"To go back before an earlier run, name it. The runs are in {RUNS_DIR}"
         )
     backup = RUNS_DIR / target
-    if backup.parent != RUNS_DIR or not ((backup / MEMORY_BEFORE).is_dir() and (backup / STATE_BEFORE).is_file()):
+    if backup.parent != RUNS_DIR or not _has_backup(backup):
         raise SystemExit(
             f"Cannot go back before run {target}: {backup} has no backup of memory and session state. "
             f"Backups are kept for the latest {BACKUPS_TO_KEEP} runs, and runs made before undo was added have none."
@@ -314,9 +384,7 @@ def _undo(run_id: str | None) -> None:
     undo_dir.mkdir(parents=True)
     _save_state(state)  # the state file may not exist yet, and the backup copies it
     _back_up(undo_dir)
-    shutil.rmtree(MEMORY_DIR)
-    shutil.copytree(backup / MEMORY_BEFORE, MEMORY_DIR)
-    _save_state(restored)
+    _restore(backup)
 
     def analyzed(entry: dict) -> str | None:
         return entry.get("transcript_sha256") if entry.get("status") == "done" else None
@@ -356,6 +424,7 @@ def _undo(run_id: str | None) -> None:
 
 
 def _run() -> None:
+    analyzer_window, organizer_window, compact_at_percent = _compaction()
     state = _load_state()
     sessions, organizer = state["sessions"], state["organizer"]
 
@@ -379,6 +448,9 @@ def _run() -> None:
         gained = finished and _gained_content(session, entry, signature)
         if finished and not gained:
             continue
+        # A session that used up its attempts gets a fresh set once its log has changed since the last one.
+        if entry.get("status") == "failed" and entry.get("log_signature") not in (None, signature):
+            entry["attempts"] = 0
         if not gained and entry.get("attempts", 0) >= MAX_ATTEMPTS:
             reason = f"gave up after {MAX_ATTEMPTS} failed attempts; last error: {entry.get('error')}"
             not_run.append((session.id, reason))
@@ -414,9 +486,9 @@ def _run() -> None:
         "project": str(Path.cwd()),
         "models": {"analyzer": (ANALYZER_MODEL, ANALYZER_EFFORT), "organizer": (ORGANIZER_MODEL, ORGANIZER_EFFORT)},
         "compaction": {
-            "percent": COMPACT_AT_PERCENT,
-            "analyzer": ANALYZER_CONTEXT_WINDOW,
-            "organizer": ORGANIZER_CONTEXT_WINDOW,
+            "percent": compact_at_percent,
+            "analyzer": analyzer_window,
+            "organizer": organizer_window,
         },
         "started": datetime.now(UTC).isoformat(timespec="seconds"),
         "finished": None,
@@ -440,13 +512,13 @@ def _run() -> None:
         if session.id in resumed:
             result["note"] = "Analyzed again: the conversation changed after its last analysis."
         record["sessions"].append(result)
-        entry.update(status="running", last_run=run_id, source=source)
+        # Taken before reading, so anything appended meanwhile counts as new.
+        signature = session.reader.log_stat(session.path)[0]
+        entry.update(status="running", last_run=run_id, source=source, log_signature=signature)
         checkpoint()
         print(f"[{number}/{len(pending)}] {source} {session.id}: ", end="", flush=True)
 
         memory_before = _files(MEMORY_DIR)
-        # Taken before reading, so anything appended meanwhile counts as new.
-        signature = session.reader.log_stat(session.path)[0]
         result["title"], digest, run = _analyze(session, run_dir)
         if run is None:
             entry["status"] = "skipped"
@@ -468,7 +540,7 @@ def _run() -> None:
                 result["summary"] = run.text
                 print(f"done ({run.usage['requests']} requests, {usd(run.cost)})")
         if entry["status"] != "failed":
-            entry.update(log_signature=signature, transcript_sha256=digest)
+            entry["transcript_sha256"] = digest
         result["status"] = entry["status"]
         checkpoint()
 
@@ -488,8 +560,8 @@ def _run() -> None:
             MEMORY_DIR,
             run_dir,
             "organizer",
-            ORGANIZER_CONTEXT_WINDOW,
-            COMPACT_AT_PERCENT,
+            organizer_window,
+            compact_at_percent,
         )
         record["agents"].append(("organizer", run))
         del organizer["running"]
