@@ -11,6 +11,7 @@ dependencies = [
     "deepagents>=0.7.35",
     "langchain>=1.4.10",
     "langchain-anthropic>=1.7.10",
+    "langchain-openai>=1.7.4",
     "python-dotenv>=1.2.4",
 ]
 

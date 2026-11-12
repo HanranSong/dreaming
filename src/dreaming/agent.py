@@ -14,6 +14,7 @@ from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_openai import ChatOpenAI
 
 # The official prompts hard-code the transcript path, so the tools expose the same virtual paths.
 UPLOADS_PATH = "/mnt/session/uploads"
@@ -36,17 +37,28 @@ PERMISSIONS = [
     FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny"),
 ]
 
-# US dollars per million tokens at list price, from the cookbook's helper. Prices change: check the pricing
-# page before relying on a figure. cache_write is the 5-minute rate, which the caching middleware uses.
+# US dollars per million tokens at list price: Claude's from the cookbook's helper, OpenAI's from its pricing
+# page on 2026-11-12. Prices change: check the pricing pages before relying on a figure. cache_write is the
+# rate of the cache each provider is used with here: Claude's 5-minute one, which the caching middleware
+# uses, and OpenAI's 30-minute one, its default.
 PRICES = {
     "claude-opus-5-5": {"input": 4.00, "cache_write": 5.00, "cache_read": 0.20, "output": 20.00},
     "claude-sonnet-5-5": {"input": 2.00, "cache_write": 2.50, "cache_read": 0.10, "output": 10.00},
     "claude-haiku-5-5": {"input": 0.10, "cache_write": 0.125, "cache_read": 0.01, "output": 0.50},
+    "gpt-6.1-sol": {"input": 2.00, "cache_write": 2.50, "cache_read": 0.10, "output": 10.00},
+    "gpt-6.1-terra": {"input": 1.00, "cache_write": 1.25, "cache_read": 0.05, "output": 5.00},
+    "gpt-6-luna": {"input": 0.10, "cache_write": 0.125, "cache_read": 0.01, "output": 0.50},
 }
 # A request whose prompt is over this many tokens pays these rates instead.
 LONG_PROMPT_PRICES = {
     "claude-haiku-5-5": {"over": 100_000, "input": 0.50, "cache_write": 0.625, "cache_read": 0.05, "output": 2.50},
+    "gpt-6.1-sol": {"over": 272_000, "input": 4.00, "cache_write": 5.00, "cache_read": 0.20, "output": 15.00},
+    "gpt-6.1-terra": {"over": 272_000, "input": 2.00, "cache_write": 2.50, "cache_read": 0.10, "output": 7.50},
+    "gpt-6-luna": {"over": 272_000, "input": 0.20, "cache_write": 0.25, "cache_read": 0.02, "output": 0.75},
 }
+# The most tokens a prompt can hold, for the models LangChain reports a larger number for: OpenAI's window of
+# 1,050,000 tokens has to hold the reply as well.
+MAX_PROMPT_TOKENS = {"gpt-6.1-sol": 922_000, "gpt-6.1-terra": 922_000, "gpt-6-luna": 922_000}
 
 # Tool arguments that hold file text. The tool log records where an agent read and wrote, not what.
 CONTENT_ARGUMENTS = {"content", "old_string", "new_string"}
@@ -110,6 +122,36 @@ def _count_usage(run: AgentRun, model: str, metadata: dict) -> None:
         ) / 1_000_000
 
 
+def _chat_model(model: str, effort: str | None) -> ChatAnthropic | ChatOpenAI:
+    """The model to call: OpenAI's for a name starting with gpt-, Claude's for any other name."""
+    if not model.startswith("gpt-"):
+        return ChatAnthropic(model=model, max_tokens=64000, streaming=True, reasoning_effort=effort)
+    return ChatOpenAI(
+        model=model,
+        max_tokens=64000,
+        streaming=True,
+        # The Responses API is the only one in which these models can reason and call tools together.
+        use_responses_api=True,
+        reasoning={"effort": effort} if effort else None,
+        # By default OpenAI would also store every reply for 30 days or more, to be fetched again by its id.
+        # Here it does not: each reply's reasoning comes back encrypted and is sent again with the next request.
+        store=False,
+        include=["reasoning.encrypted_content"],
+    )
+
+
+def _stop_reason(message) -> str | None:
+    """Why the model stopped, in Claude's words: end_turn means it finished its reply."""
+    metadata = message.response_metadata
+    if metadata.get("model_provider") != "openai":
+        return metadata.get("stop_reason")
+    if metadata.get("status") != "completed":  # cut off: incomplete_details says by what
+        return (metadata.get("incomplete_details") or {}).get("reason") or metadata.get("status")
+    if any(isinstance(block, dict) and block.get("type") == "refusal" for block in message.content):
+        return "refusal"
+    return "end_turn"
+
+
 class SummaryCallWatcher(BaseCallbackHandler):
     """Accounts for compaction's summary calls, which never reach the agent's message list."""
 
@@ -122,7 +164,7 @@ class SummaryCallWatcher(BaseCallbackHandler):
     def on_llm_end(self, response, **kwargs) -> None:
         message = response.generations[0][0].message
         _count_usage(self.run, self.model, message.usage_metadata or {})
-        stop_reason = message.response_metadata.get("stop_reason")
+        stop_reason = _stop_reason(message)
         if stop_reason != "end_turn":
             raise RuntimeError(f"compaction summary stopped early: {stop_reason}")
         self.run.usage["compactions"] += 1
@@ -166,8 +208,10 @@ def run_agent(
     run = AgentRun(cost=0.0 if model in PRICES else None)
     tool_log = run_dir / "tool_calls.jsonl"
     try:
-        chat_model = ChatAnthropic(model=model, max_tokens=64000, streaming=True, reasoning_effort=effort)
-        window = context_window or (chat_model.profile or {}).get("max_input_tokens")
+        chat_model = _chat_model(model, effort)
+        window = (
+            context_window or MAX_PROMPT_TOKENS.get(model) or (chat_model.profile or {}).get("max_input_tokens")
+        )
         if not window:
             raise ValueError(f"no known context window for {model}: set its CONTEXT_WINDOW in .env")
         backend = CompositeBackend(
@@ -205,7 +249,8 @@ def run_agent(
                     summary_prompt=summary_prompt,
                     trim_tokens_to_summarize=None,  # the default would summarize only the last 4,000 tokens
                 ),
-                AnthropicPromptCachingMiddleware(),
+                # OpenAI caches a prompt's beginning by itself. Claude has to be told where to cache.
+                *([AnthropicPromptCachingMiddleware()] if isinstance(chat_model, ChatAnthropic) else []),
             ],
         )
         messages, calls = [], {}
@@ -221,7 +266,7 @@ def run_agent(
                     _log_tool_call(tool_log, label, calls.get(message.tool_call_id, {}), message)
             messages = state["messages"]
 
-        stop_reason = messages[-1].response_metadata.get("stop_reason")
+        stop_reason = _stop_reason(messages[-1])
         if stop_reason == "end_turn":
             run.text = str(messages[-1].text)
         else:
