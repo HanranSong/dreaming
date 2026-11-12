@@ -18,6 +18,7 @@ adapted from that cookbook's, and `src/dreaming/render.py` is copied from it unc
 - An Anthropic or OpenAI API key.
 - A project folder where you have already used Claude Code or Codex. Dreaming reads the session logs those
   tools keep under `~/.claude` and `~/.codex`.
+- For the daily run only: cron. See [Run every day](#run-every-day).
 
 To install uv on a new machine:
 
@@ -65,6 +66,8 @@ analysis. Run it again whenever you like: sessions that are already done cost no
 | What you see | What it means |
 | --- | --- |
 | `Nothing to do.` | No new or changed sessions were found for this folder. |
+| `No Claude Code or Codex session was started in <folder>` | Run it from the folder you start those tools in, the project's root folder. |
+| `ANTHROPIC_API_KEY is not set` (or `OPENAI_API_KEY`) | The models in `dreaming/.env` need that key. Fill it in there. |
 | `Not run <id>: waiting` | The session's log changed in the last 30 minutes, so it may still be in use. Run again later. |
 | `failed` | The session is retried on the next run, up to 3 attempts. |
 
@@ -101,7 +104,14 @@ uv run --project dreaming dreaming undo 20261112-160548
 
 ## Run every day
 
-To turn a daily run on, from the project's root folder:
+The daily run uses cron, as the official cookbook does. macOS has it. Many Linux machines do not: check with
+`command -v crontab`, and if nothing is printed, install it. On Debian or Ubuntu:
+
+```bash
+sudo apt install cron
+```
+
+Then, to turn a daily run on, from the project's root folder:
 
 ```bash
 uv run --project dreaming dreaming schedule on
@@ -120,11 +130,12 @@ uv run --project dreaming dreaming schedule off
 - **It spends money without asking.** A day with no new sessions costs nothing.
 - **Each run's output** is added to `dreaming/.state/schedule.log`, and its report is under
   `dreaming/.state/runs/` as usual.
-- **The machine has to be on.** Where cron is installed, the schedule is a line in your crontab, and a run
-  missed while the machine was off is skipped. Elsewhere on Linux it is a systemd user timer, and a missed
-  run happens when the machine is next on.
-- **On a server you log out of**, a systemd user timer fires only while you are logged in unless lingering
-  is on for your user. `schedule on` tries to turn it on and tells you the command to run if it cannot.
+- **The machine has to be on** at that time, but you do not have to be logged in. A run missed while the
+  machine was off or asleep is skipped, and the next run takes its sessions.
+- **The schedule is one line in your crontab**, which `crontab -l` shows. Your other lines are left as they
+  are.
+- **If something it needs is missing**, `schedule on` says what and how to add it: cron to install or start,
+  or an API key to fill in. `schedule status` repeats any warning.
 
 ## Let Claude Code and Codex read the memory
 

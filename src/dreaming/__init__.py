@@ -298,6 +298,19 @@ def _analyze(session: Session, run_dir: Path) -> tuple[str, str | None, AgentRun
     return title, digest, run
 
 
+def _missing_keys() -> list[str]:
+    """One line for each API key the configured models need that is not set."""
+    needed: dict[str, list[str]] = {}
+    for agent, model in (("analyzer", ANALYZER_MODEL), ("organizer", ORGANIZER_MODEL)):
+        key = "OPENAI_API_KEY" if model.startswith("gpt-") else "ANTHROPIC_API_KEY"
+        needed.setdefault(key, []).append(f"the {agent} ({model})")
+    return [
+        f"{key} is not set, and it is needed for {' and '.join(uses)}. Fill it in {DREAMING_DIR / '.env'}."
+        for key, uses in needed.items()
+        if not os.getenv(key)
+    ]
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="dreaming",
@@ -313,7 +326,9 @@ def _arguments() -> argparse.Namespace:
     undo.add_argument(
         "run",
         nargs="?",
-        help=f"the run to go back before: its folder's name in {RUNS_DIR}. Leave out for the latest run.",
+        # argparse reads % in help as a format, so one in the folder's path is doubled.
+        help=f"the run to go back before: its folder's name in {str(RUNS_DIR).replace('%', '%%')}. "
+        "Leave out for the latest run.",
     )
     scheduled = commands.add_parser(
         "schedule",
@@ -335,12 +350,16 @@ def _arguments() -> argparse.Namespace:
 def main() -> None:
     arguments = _arguments()
     if arguments.command == "schedule":
+        if arguments.action == "off":
+            print(schedule.turn_off(DREAMING_DIR))
+            return
         if arguments.action == "on":
             print(schedule.turn_on(DREAMING_DIR, Path.cwd(), SCHEDULE_LOG, arguments.at))
-        elif arguments.action == "off":
-            print(schedule.turn_off(DREAMING_DIR))
         else:
             print(schedule.describe(DREAMING_DIR, SCHEDULE_LOG))
+        if schedule.status(DREAMING_DIR):
+            for missing in _missing_keys():
+                print(f"Warning: {missing} Until it is, every scheduled run fails.")
         return
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -440,7 +459,8 @@ def _run() -> None:
     cutoff = time.time() - SESSION_QUIET_SECONDS
     pending, not_run, resumed = [], [], set()
     abandoned = False  # a session out of attempts is work left undone, so the run must not exit as a success
-    for session in _project_sessions(Path.cwd()):
+    found = _project_sessions(Path.cwd())
+    for session in found:
         entry = sessions.get(session.id, {})
         # Both cover the subagent logs and saved tool outputs too: a transcript is built from all of them.
         signature, changed_at = session.reader.log_stat(session.path)
@@ -470,10 +490,18 @@ def _run() -> None:
     if not pending and (not organizer["pending"] or organizer_gave_up):
         if organizer_gave_up:
             print(f"Organizer gave up after {MAX_ATTEMPTS} failed attempts; last error: {organizer.get('error')}")
+        if not found:
+            print(
+                f"No Claude Code or Codex session was started in {Path.cwd()}. Run dreaming from the folder "
+                "you start them in, which for a project is its root folder."
+            )
         print("Nothing to do.")
         if abandoned or organizer_gave_up:
             raise SystemExit(1)
         return
+
+    if missing := _missing_keys():
+        raise SystemExit("\n".join(missing))
 
     run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     run_dir = RUNS_DIR / run_id
