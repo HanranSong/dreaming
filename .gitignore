@@ -219,5 +219,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Dreaming run state
+# Dreaming run state, and the memory of the project this copy is used in
 .state/
+memory/

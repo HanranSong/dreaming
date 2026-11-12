@@ -7,6 +7,10 @@ rediscovering the same facts.
 Each run has two steps. An analyzer agent reads each new session and adds its durable facts to the memory
 folder. Then an organizer agent merges duplicates, marks conflicts and rebuilds the index.
 
+This is a local version of "Dreaming with a dynamic workflow" from Anthropic's
+[claude-cookbooks](https://github.com/anthropics/claude-cookbooks) (MIT License). The agents' prompts are
+adapted from that cookbook's, and `src/dreaming/render.py` is copied from it unchanged.
+
 ## Requirements
 
 - Linux or macOS. On Windows, use WSL.

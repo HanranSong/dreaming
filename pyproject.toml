@@ -1,7 +1,7 @@
 [project]
 name = "dreaming"
 version = "0.1.0"
-description = "Add your description here"
+description = "Distill a project's Claude Code and Codex sessions into Markdown memory files"
 readme = "README.md"
 authors = [
     { name = "Hanran Song" }
