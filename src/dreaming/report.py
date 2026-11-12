@@ -55,8 +55,9 @@ def write_report(path: Path, record: dict) -> None:
         "- Sessions: " + (", ".join(f"{count} {status}" for status, count in counts.items()) or "none"),
         f"- Organizer: {organizer['status']}",
         f"- Estimated cost: {usd(_total_cost(agents))} at list price",
-        "- Also in this folder: tool_calls.jsonl (each tool call an agent made), memory_before/ "
-        "(memory as it was before this run, kept for the latest runs only) and, if an agent's context "
+        "- Also in this folder: tool_calls.jsonl (each tool call an agent made), memory_before/ and "
+        "sessions_before.json (memory and session state as they were before this run, which undo puts back; "
+        "kept for the latest runs only) and, if an agent's context "
         "was compacted, conversation_history/ (the messages compaction replaced) and large_tool_results/ "
         "(tool results moved out of a request that was too long)",
         "",

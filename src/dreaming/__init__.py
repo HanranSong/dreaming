@@ -1,5 +1,6 @@
 """Dream over this project's Claude Code and Codex sessions into a local memory directory."""
 
+import argparse
 import fcntl
 import hashlib
 import json
@@ -14,7 +15,7 @@ from typing import NamedTuple
 
 from dotenv import load_dotenv
 
-from dreaming import codex
+from dreaming import codex, schedule
 from dreaming import sessions as claude_code
 from dreaming.agent import MEMORY_PATH, UPLOADS_PATH, AgentRun, run_agent
 from dreaming.render import render_text
@@ -59,6 +60,10 @@ TRANSCRIPT_DIR = STATE_DIR / "transcripts"
 RUNS_DIR = STATE_DIR / "runs"
 STATE_FILE = STATE_DIR / "sessions.json"
 LOCK_FILE = STATE_DIR / "lock"
+SCHEDULE_LOG = STATE_DIR / "schedule.log"
+# Each run folder's copies of memory and of the state file from before the run: what undo puts back.
+MEMORY_BEFORE = "memory_before"
+STATE_BEFORE = "sessions_before.json"
 LEGACY_PROCESSED_FILE = STATE_DIR / "processed.json"  # the first version's list of analyzed sessions
 PROMPT_DIR = Path(__file__).parent / "prompts"
 
@@ -155,10 +160,17 @@ def _remove_stubs() -> int:
     return len(stubs)
 
 
+def _back_up(run_dir: Path) -> None:
+    """Copy memory and the state file as they are now into a run's folder, for undo to put back."""
+    shutil.copytree(MEMORY_DIR, run_dir / MEMORY_BEFORE)
+    shutil.copy(STATE_FILE, run_dir / STATE_BEFORE)
+
+
 def _prune_backups() -> None:
     # Run folders are named by start time, so sorting by path puts the oldest first.
-    for backup in sorted(RUNS_DIR.glob("*/memory_before"))[:-BACKUPS_TO_KEEP]:
+    for backup in sorted(RUNS_DIR.glob(f"*/{MEMORY_BEFORE}"))[:-BACKUPS_TO_KEEP]:
         shutil.rmtree(backup)
+        (backup.parent / STATE_BEFORE).unlink(missing_ok=True)
 
 
 def _render(session: Session) -> tuple[str, str | None, str | None]:
@@ -217,7 +229,50 @@ def _analyze(session: Session, run_dir: Path) -> tuple[str, str | None, AgentRun
     return title, digest, run
 
 
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="dreaming",
+        description="With no command, analyze the new sessions of the folder you are in into memory.",
+    )
+    commands = parser.add_subparsers(dest="command", metavar="command")
+    undo = commands.add_parser(
+        "undo",
+        help="put memory back to how it was before the latest run",
+        description="Put memory back to how it was before a run. The sessions analyzed since are analyzed "
+        "again on the next run.",
+    )
+    undo.add_argument(
+        "run",
+        nargs="?",
+        help=f"the run to go back before: its folder's name in {RUNS_DIR}. Leave out for the latest run.",
+    )
+    scheduled = commands.add_parser(
+        "schedule",
+        help="turn a daily run on or off",
+        description="Turn a daily run over the folder you are in on or off, or show whether it is on.",
+    )
+    scheduled.add_argument("action", choices=["on", "off", "status"])
+    scheduled.add_argument(
+        "--at",
+        metavar="HH:MM",
+        help=f"with on: the time of day to run at, in this machine's time. {schedule.DEFAULT_TIME} if left out.",
+    )
+    arguments = parser.parse_args()
+    if arguments.command == "schedule" and arguments.at and arguments.action != "on":
+        parser.error("--at goes with: schedule on")
+    return arguments
+
+
 def main() -> None:
+    arguments = _arguments()
+    if arguments.command == "schedule":
+        if arguments.action == "on":
+            print(schedule.turn_on(DREAMING_DIR, Path.cwd(), SCHEDULE_LOG, arguments.at))
+        elif arguments.action == "off":
+            print(schedule.turn_off(DREAMING_DIR))
+        else:
+            print(schedule.describe(DREAMING_DIR, SCHEDULE_LOG))
+        return
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     # Two runs at once would analyze the same sessions and overwrite each other's memory and state. The system
@@ -227,7 +282,77 @@ def main() -> None:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit(f"Another dreaming run is still working in {DREAMING_DIR}. Run again when it ends.")
-        _run()
+        if arguments.command == "undo":
+            _undo(arguments.run)
+        else:
+            _run()
+
+
+def _undo(run_id: str | None) -> None:
+    """Put memory and the state file back to how they were before a run: the latest one unless one is named.
+
+    The state file goes back too, so the sessions analyzed since count as not analyzed and the next run takes
+    them again. What is replaced is backed up first, in a run folder of its own, so an undo can be undone.
+    """
+    state = _load_state()
+    target = run_id or state.get("last_run")
+    if not target:
+        raise SystemExit(
+            "Nothing to undo: no run has changed memory since the last undo, or since undo was added. "
+            f"To go back before an earlier run, name it. The runs are in {RUNS_DIR}"
+        )
+    backup = RUNS_DIR / target
+    if backup.parent != RUNS_DIR or not ((backup / MEMORY_BEFORE).is_dir() and (backup / STATE_BEFORE).is_file()):
+        raise SystemExit(
+            f"Cannot go back before run {target}: {backup} has no backup of memory and session state. "
+            f"Backups are kept for the latest {BACKUPS_TO_KEEP} runs, and runs made before undo was added have none."
+        )
+    restored = json.loads((backup / STATE_BEFORE).read_text())
+
+    undo_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S") + "-undo"
+    undo_dir = RUNS_DIR / undo_id
+    undo_dir.mkdir(parents=True)
+    _save_state(state)  # the state file may not exist yet, and the backup copies it
+    _back_up(undo_dir)
+    shutil.rmtree(MEMORY_DIR)
+    shutil.copytree(backup / MEMORY_BEFORE, MEMORY_DIR)
+    _save_state(restored)
+
+    def analyzed(entry: dict) -> str | None:
+        return entry.get("transcript_sha256") if entry.get("status") == "done" else None
+
+    again = sorted(
+        session_id
+        for session_id, entry in state["sessions"].items()
+        if analyzed(entry) and analyzed(restored["sessions"].get(session_id, {})) != analyzed(entry)
+    )
+    changes = _memory_changes(undo_dir / MEMORY_BEFORE)
+    listed = [f"- {kind.capitalize()}: {', '.join(names)}" for kind, names in changes.items() if names]
+    report = [
+        f"# Dreaming undo {undo_id}",
+        "",
+        f"- Went back to before run: {target}",
+        f"- Done: {datetime.now(UTC).isoformat(timespec='seconds')}",
+        f"- To reverse this undo: dreaming undo {undo_id}",
+        f"- Also in this folder: {MEMORY_BEFORE}/ and {STATE_BEFORE} (memory and session state as they were "
+        "before this undo, kept for the latest runs only)",
+        "",
+        "## Sessions analyzed since then, which the next run analyzes again",
+        "",
+        *([f"- {session_id}" for session_id in again] or ["None."]),
+        "",
+        "## Memory changes",
+        "",
+        *(listed or ["No file in memory/ changed."]),
+    ]
+    (undo_dir / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    _prune_backups()
+
+    counts = ", ".join(f"{len(names)} {kind}" for kind, names in changes.items())
+    print(f"Memory and session state are back to how they were before run {target}.")
+    print(f"Memory files: {counts}.")
+    print(f"{len(again)} session(s) analyzed since then will be analyzed again on the next run.")
+    print(f"To reverse this undo: dreaming undo {undo_id}")
 
 
 def _run() -> None:
@@ -281,7 +406,9 @@ def _run() -> None:
     run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True)
-    shutil.copytree(MEMORY_DIR, run_dir / "memory_before")
+    _back_up(run_dir)
+    # The run a bare undo goes back before. Set after the backup, so the backup names the run before this one.
+    state["last_run"] = run_id
     record = {
         "id": run_id,
         "project": str(Path.cwd()),
@@ -302,7 +429,7 @@ def _run() -> None:
 
     def checkpoint() -> None:
         _save_state(state)
-        record["memory_changes"] = _memory_changes(run_dir / "memory_before")
+        record["memory_changes"] = _memory_changes(run_dir / MEMORY_BEFORE)
         write_report(run_dir / "report.md", record)
 
     print(f"Run {run_id}: {len(pending)} session(s) to analyze.")
