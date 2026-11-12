@@ -32,11 +32,11 @@ def _whole_number(name: str, low: int, high: float = float("inf")) -> int | None
     return int(text)
 
 
-# The default models are the official cookbook's. An empty effort leaves it to the API's default.
+# The defaults are what the official cookbook's agents ran with. It names no effort; its platform ran them at medium.
 ANALYZER_MODEL = os.getenv("DREAMING_ANALYZER_MODEL") or "claude-haiku-5-5"
 ORGANIZER_MODEL = os.getenv("DREAMING_ORGANIZER_MODEL") or "claude-haiku-5-5"
-ANALYZER_EFFORT = os.getenv("DREAMING_ANALYZER_EFFORT") or None
-ORGANIZER_EFFORT = os.getenv("DREAMING_ORGANIZER_EFFORT") or None
+ANALYZER_EFFORT = os.getenv("DREAMING_ANALYZER_EFFORT") or "medium"
+ORGANIZER_EFFORT = os.getenv("DREAMING_ORGANIZER_EFFORT") or "medium"
 # An empty context window uses the model's own. The percent stays above 10 because compaction keeps the latest 10%.
 ANALYZER_CONTEXT_WINDOW = _whole_number("DREAMING_ANALYZER_CONTEXT_WINDOW", 1000)
 ORGANIZER_CONTEXT_WINDOW = _whole_number("DREAMING_ORGANIZER_CONTEXT_WINDOW", 1000)
