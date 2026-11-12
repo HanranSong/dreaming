@@ -23,7 +23,10 @@ MEMORY_PATH = "/mnt/memory/dreaming"
 HISTORY_PATH = "/conversation_history"
 # Where it moves a tool result out of a request the model refused as too long. DeepAgents fixes this name too.
 LARGE_RESULTS_PATH = "/large_tool_results"
-READ_ONLY_PATHS = [f"{UPLOADS_PATH}/**", f"{HISTORY_PATH}/**", f"{LARGE_RESULTS_PATH}/**"]
+# Each folder is listed with what is in it: a search of a whole folder asks for the folder's own path.
+READ_ONLY_PATHS = [
+    path for folder in (UPLOADS_PATH, HISTORY_PATH, LARGE_RESULTS_PATH) for path in (folder, f"{folder}/**")
+]
 
 # The official analyzer and organizer toolset: read, write, edit, glob and grep.
 TOOLS = ["read_file", "write_file", "edit_file", "glob", "grep"]
