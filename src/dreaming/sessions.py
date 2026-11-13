@@ -12,6 +12,10 @@ PERSISTED_OUTPUT = re.compile(
 # The event that carries a user message's time. render_text has no label for it, so it prints the event as an
 # "EVENT message.time:" line above the message, which is how the analyzer prompt describes it.
 TIME_EVENT = "message.time"
+# The event above a compaction summary in a log that lost messages it covers. render_text prints it
+# as an "EVENT compaction.summary:" line, which the analyzer prompt describes, and the summary below it as an
+# AGENT: block, since Claude Code's model wrote it.
+SUMMARY_EVENT = "compaction.summary"
 
 SOURCE = "claude-code"
 
@@ -116,11 +120,75 @@ def _events(record: dict, session_dir: Path):
             }
 
 
+def _preserved_by(records: list[dict], index: int) -> set:
+    """The uuids of the messages that the compaction at records[index] kept as they were."""
+    metadata = records[index].get("compactMetadata") or {}
+    preserved = metadata.get("preservedMessages") or {}
+    kept = {*(preserved.get("uuids") or []), *(preserved.get("allUuids") or [])}
+    segment = metadata.get("preservedSegment") or {}
+    # The segment runs from its tail back to its head along parent links. A message replayed later in the log
+    # can carry a rewritten link, so each uuid's first record gives it; a walk that misses the head counts
+    # for nothing.
+    parents = {}
+    for record in records[:index]:
+        if record.get("uuid"):
+            parents.setdefault(record["uuid"], record.get("parentUuid"))
+    uuid, walked = segment.get("tailUuid"), set()
+    while uuid and uuid not in walked:
+        walked.add(uuid)
+        if uuid == segment.get("headUuid"):
+            return kept | walked
+        uuid = parents.get(uuid)
+    return kept
+
+
+def _trimmed(records: list[dict]) -> bool:
+    """Whether Claude Code deleted messages from this log, leaving its compaction summaries in their place.
+
+    Its transcript GC deletes the messages before the last compaction except those that compaction preserved,
+    and a Remote Control resume can rewrite the log from the server's copy, which starts near the last
+    compaction. A log neither touched starts at the conversation's root, and before each compaction it holds
+    messages that compaction did not preserve, at least the ones it summarized.
+
+    Some links are not trusted. A compaction's logicalParentUuid can name a message that was never written to
+    the log, and a later compaction or a resume can replay earlier messages, under their own uuids, after
+    newer ones, so a parent can turn up further down the log and the records after a compaction can point to
+    any message before it.
+    """
+    first = next((record for record in records if "parentUuid" in record), None)
+    if first and first["parentUuid"]:
+        return True  # the log starts part-way through the conversation
+    for index, record in enumerate(records):
+        if record.get("subtype") == "compact_boundary":
+            preserved = _preserved_by(records, index)
+            if not any(
+                earlier.get("type") in ("user", "assistant")
+                and not earlier.get("isCompactSummary")
+                and earlier.get("uuid") not in preserved
+                for earlier in records[:index]
+            ):
+                return True
+    return False
+
+
 def _log_events(path: Path, session_dir: Path) -> list[dict]:
+    records = list(_records(path))
+    # In a trimmed log every summary is kept. Each may be all that is left of what it summarized, and the GC
+    # can keep an earlier summary while deleting the messages it summarized and those after it.
+    trimmed = _trimmed(records)
     events, timed = [], None
-    for record in _records(path):
+    for record in records:
+        if trimmed and record.get("isCompactSummary"):
+            written = (record.get("timestamp") or "")[:19]
+            events.append({"type": SUMMARY_EVENT, **({"utc": f"{written}Z"} if written else {})})
+            events.extend(
+                {"type": "agent.message", "content": event["content"]}
+                for event in _events(record, session_dir)
+                if event["type"] == "user.message"
+            )
+            continue
         # Text the user did not write: isMeta marks injected text such as skill bodies, and isCompactSummary
-        # a model-written summary of earlier messages, which stay in the log.
+        # a model-written summary of earlier messages, which stay in the log unless it was trimmed.
         injected = record.get("isMeta") or record.get("isCompactSummary")
         if record.get("type") in ("user", "assistant") and not injected:
             new = list(_events(record, session_dir))
