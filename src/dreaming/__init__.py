@@ -228,16 +228,16 @@ def _finish_restore() -> None:
     print(f"Finished an interrupted undo: memory and session state are back to before run {backup.name}.")
 
 
-def _digest(export: dict, *, titled: bool = False) -> str | None:
+def _digest(export: dict, *, title: str = "") -> str | None:
     """A digest that tells whether a session's conversation changed. None when it has no conversation.
 
     It leaves out the transcript's time lines and the session's title, which the tool can change long after
-    the conversation ended. titled gives the digest earlier versions stored, which had the title in it.
+    the conversation ended. Earlier versions stored a digest with the title in it: given the title they read,
+    this gives the digest they stored.
     """
     if not any(thread["events"] for thread in export["threads"]):
         return None
-    if not titled:
-        export = {**export, "session": {**export["session"], "title": ""}}
+    export = {**export, "session": {**export["session"], "title": title}}
     return hashlib.sha256(render_text(without_times(export)).encode(errors="replace")).hexdigest()
 
 
@@ -254,7 +254,10 @@ def _gained_content(session: Session, entry: dict, signature: str) -> bool:
         return False
     try:
         export = session.reader.load_session(session.path)
-        digests = (_digest(export), _digest(export, titled=True))
+        # For a Claude Code session, earlier versions read the title Claude Code generated, even when the
+        # session had been renamed.
+        earlier_title = export["session"].get("ai_title", export["session"]["title"])
+        digests = (_digest(export), _digest(export, title=earlier_title))
     except Exception as error:  # not known, so nothing is recorded and the next run checks again
         print(f"Could not check {session.id} for new content: {error!r}", file=sys.stderr)
         return False

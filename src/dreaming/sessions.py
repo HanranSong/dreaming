@@ -163,10 +163,14 @@ def without_times(export: dict) -> dict:
 def load_session(path: Path) -> dict:
     """One session log and its subagents as the dict render_text takes, with a time event above user messages."""
     session_dir = path.with_suffix("")
-    title = ""
+    # A name the user gave the session comes before the one Claude Code generated from its first message, as
+    # in Claude Code's own session list. Both are logged again as the session goes on, so the last one counts.
+    custom_title = ai_title = ""
     for record in _records(path):
-        if record.get("type") == "ai-title":
-            title = record.get("aiTitle", title)
+        if record.get("type") == "custom-title":
+            custom_title = record.get("customTitle") or custom_title
+        elif record.get("type") == "ai-title":
+            ai_title = record.get("aiTitle") or ai_title
     primary = {
         "id": "primary",
         "parent_thread_id": None,
@@ -174,7 +178,13 @@ def load_session(path: Path) -> dict:
         "events": _log_events(path, session_dir),
     }
     return {
-        "session": {"id": path.stem, "title": title, "created_at": started_at(path)},
+        # ai_title is not rendered. It is the title earlier versions read, which _gained_content needs.
+        "session": {
+            "id": path.stem,
+            "title": custom_title or ai_title,
+            "ai_title": ai_title,
+            "created_at": started_at(path),
+        },
         "agent": {"name": SOURCE},
         "threads": [primary, *_subagent_threads(session_dir)],
     }
