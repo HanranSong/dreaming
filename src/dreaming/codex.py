@@ -8,9 +8,11 @@ from compression import zstd
 from functools import cache
 from pathlib import Path
 
+from dreaming import formats
 from dreaming.sessions import TIME_EVENT, files_stat
 
 SOURCE = "codex"
+TOOL = "Codex"  # as format notes name it
 
 # Threads Codex starts for itself rather than for the project's work: the reviews behind its automatic
 # approvals, its compaction and its own memory. Each has a log like any other thread.
@@ -48,6 +50,9 @@ INJECTED = re.compile(
     r"|external_\w+)>.*</\1>",
     re.DOTALL,
 )
+# A tag named as Codex names its own, in lower case with an underscore, around a whole block: text Codex may
+# have added under a tag that is not in INJECTED yet. A snippet of HTML or XML the user pasted is not taken for one.
+OWN_TAG = re.compile(r"<([a-z][a-z0-9]*(?:_[a-z0-9]+)+)>.*</\1>", re.DOTALL)
 
 
 def _home() -> Path:
@@ -58,11 +63,17 @@ def _records(path: Path):
     # Codex can keep a log compressed, as rollout-....jsonl.zst.
     opened = zstd.open(path, "rt", encoding="utf-8") if path.suffix == ".zst" else path.open(encoding="utf-8")
     with opened as lines:
+        broken = False
         for line in lines:
+            if not line.strip():
+                continue
+            if broken:  # a session still being written can end in a partial line, but only its last line
+                formats.note(TOOL, "a line that is not JSON was skipped", path)
+                broken = False
             try:
                 yield json.loads(line)
             except json.JSONDecodeError:
-                continue  # a session still being written can end in a partial line
+                broken = True
 
 
 def _subagent(meta: dict):
@@ -105,12 +116,22 @@ def _threads() -> dict[Path, dict]:
         except Exception as error:  # one broken log, of any project, must not hide every other session
             print(f"Left out a Codex log that could not be read: {log}: {error!r}", file=sys.stderr)
             continue
+        if first is None:
+            continue  # nothing written to it yet
         meta = first.get("payload") if isinstance(first, dict) and first.get("type") == "session_meta" else None
         # The id names the transcript file, so only a plain one is taken.
-        if isinstance(meta, dict) and re.fullmatch(r"[\w-]+", str(meta.get("id"))) and not _internal(meta):
+        if not (isinstance(meta, dict) and re.fullmatch(r"[\w-]+", str(meta.get("id")))):
+            formats.note(TOOL, "a log does not open with a session_meta naming its thread, and was left out", log)
+        elif not _internal(meta):
+            if not _parent(meta) and not meta.get("cwd"):
+                formats.note(TOOL, "a session's session_meta names no folder (cwd), so it belongs to no project", log)
             # A thread with two logs, such as a live one and an archived one, is read from the newer.
             threads = {other: has for other, has in threads.items() if has["id"] != meta["id"]}
             threads[log] = meta
+    index = home / "session_index.jsonl"
+    if not logs and index.is_file() and next(_records(index), None):
+        where = "sessions/ or archived_sessions/"
+        formats.note(TOOL, f"its index lists sessions, but no log was found under {where}", index)
     return dict(sorted(threads.items(), key=lambda item: item[1].get("timestamp") or ""))
 
 
@@ -150,7 +171,7 @@ def log_stat(path: Path) -> tuple[str, float]:
     return files_stat([path, *_sub_threads(path)], _home())
 
 
-def _blocks(content, *, from_user: bool = False):
+def _blocks(content, log: Path, *, from_user: bool = False):
     """A message's or tool result's content with its text as the text blocks render_text reads. Images are
     dropped, and from the user's turn so is the text Codex injected. Codex encrypts the task one agent gives
     another, so all that can be said of such a block is that it was there."""
@@ -162,6 +183,9 @@ def _blocks(content, *, from_user: bool = False):
         if kind in ("input_text", "output_text", "text") and isinstance(block.get("text"), str):
             if not (from_user and INJECTED.fullmatch(block["text"].strip())):
                 blocks.append({"type": "text", "text": block["text"]})
+                if from_user and (tag := OWN_TAG.fullmatch(block["text"].strip())):
+                    what = f"a user message wholly inside a <{tag[1]}> tag was read as the user's"
+                    formats.note(TOOL, f"{what}; Codex may have added it", log)
         elif kind == "encrypted_content":
             blocks.append({"type": "text", "text": "[encrypted by Codex]"})
         elif "image" not in str(kind):
@@ -181,22 +205,23 @@ def _call_input(item: dict):
     return {key: value for key, value in item.items() if key not in BOOKKEEPING}
 
 
-def _events(item: dict, agent_path: str):
+def _events(item: dict, agent_path: str, log: Path):
     """Turn one response item into transcript events. Developer messages are Codex's own instructions."""
     kind = str(item.get("type"))
     if kind == "message":
         role = item.get("role")
-        content = _blocks(item.get("content"), from_user=role == "user")
+        content = _blocks(item.get("content"), log, from_user=role == "user")
         if role in ("user", "assistant") and content:
             yield {"type": "user.message" if role == "user" else "agent.message", "content": content}
     elif kind == "agent_message":  # between two agents of the session, each named by its path
-        content = _blocks(item.get("content"))
+        content = _blocks(item.get("content"), log)
         if item.get("author") == agent_path:
             yield {"type": "agent.thread_message_sent", "to_agent_name": item.get("recipient"), "content": content}
         else:
             yield {"type": "agent.thread_message_received", "from_agent_name": item.get("author"), "content": content}
     elif kind.endswith("_call_output"):
-        yield {"type": "agent.tool_result", "tool_use_id": item.get("call_id"), "content": _blocks(item.get("output"))}
+        output = _blocks(item.get("output"), log)
+        yield {"type": "agent.tool_result", "tool_use_id": item.get("call_id"), "content": output}
     elif kind.endswith("_call"):
         yield {
             "type": "agent.tool_use",
@@ -205,6 +230,7 @@ def _events(item: dict, agent_path: str):
             "input": _call_input(item),
         }
     elif kind not in SKIPPED_ITEMS:  # an item this reader does not know is kept, as an EVENT line
+        formats.note(TOOL, f'a response item of type "{kind}" is not known and was kept as an EVENT line', log)
         yield {"type": f"codex.{kind}", **{key: value for key, value in item.items() if key not in BOOKKEEPING}}
 
 
@@ -234,8 +260,9 @@ def _log_events(path: Path) -> list[dict]:
         if kind in SKIPPED_RECORDS or not isinstance(payload, dict) or payload.get("id") in inherited:
             continue
         if kind == "response_item":
-            new = list(_events(payload, agent_path))
+            new = list(_events(payload, agent_path, path))
         else:  # a kind of record this reader does not know is kept, as an EVENT line
+            formats.note(TOOL, f'a record of type "{kind}" is not known and was kept as an EVENT line', path)
             new = [{"type": f"codex.{kind}", "payload": payload}]
         # As in Claude Code's logs: each user message gets its own time, to the second.
         time = (record.get("timestamp") or "")[:19]

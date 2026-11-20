@@ -3,7 +3,10 @@
 import hashlib
 import json
 import re
+from itertools import islice
 from pathlib import Path
+
+from dreaming import formats
 
 # The preview Claude Code leaves in the log when a tool result is too large to keep inline.
 PERSISTED_OUTPUT = re.compile(
@@ -18,15 +21,32 @@ TIME_EVENT = "message.time"
 SUMMARY_EVENT = "compaction.summary"
 
 SOURCE = "claude-code"
+TOOL = "Claude Code"  # as format notes name it
+
+# Content blocks left out of a transcript on purpose: the model's thinking, as in the official export, and
+# attached files.
+LEFT_OUT_BLOCKS = {"thinking", "redacted_thinking", "image", "document"}
+# Records that hold a message without being part of the conversation: Claude Code's copy of what it sent the API.
+NOT_CONVERSATION = {"api-request-blob"}
+# How a compaction summary opens. One not marked as a summary would read as something the user said.
+SUMMARY_OPENING = "This session is being continued from a previous conversation"
+# How many records into a log the folder it was started in is looked for, when looking through every project's.
+RECORDS_TO_FOLDER = 50
 
 
 def _records(path: Path):
     with path.open(encoding="utf-8") as lines:
+        broken = False
         for line in lines:
+            if not line.strip():
+                continue
+            if broken:  # a session still being written can end in a partial line, but only its last line
+                formats.note(TOOL, "a line that is not JSON was skipped", path)
+                broken = False
             try:
                 yield json.loads(line)
             except json.JSONDecodeError:
-                continue  # a session still being written can end in a partial line
+                broken = True
 
 
 def started_at(path: Path) -> str:
@@ -44,10 +64,21 @@ def _started_in(path: Path) -> str | None:
 
 def session_files(project_root: Path) -> list[Path]:
     """The session logs Claude Code keeps for this project, earliest session first."""
+    projects = Path.home() / ".claude" / "projects"
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(project_root))
-    logs = (Path.home() / ".claude" / "projects" / slug).glob("*.jsonl")
+    logs = (projects / slug).glob("*.jsonl")
     # Two folders can share a slug, /a-b and /a/b for one, so each log is checked for the folder it names.
-    return sorted((log for log in logs if _started_in(log) in (None, str(project_root))), key=started_at)
+    found = sorted((log for log in logs if _started_in(log) in (None, str(project_root))), key=started_at)
+    if not found:
+        # Were Claude Code to name a project's folder another way, its sessions would never be found. So a
+        # project with none is looked for in the other folders, by the folder each log names.
+        for log in projects.glob("*/*.jsonl"):
+            first = islice(_records(log), RECORDS_TO_FOLDER)
+            started_in = next((record["cwd"] for record in first if record.get("cwd")), None)
+            if log.parent.name != slug and started_in == str(project_root):
+                where = f"projects/{log.parent.name}, not projects/{slug}"
+                formats.note(TOOL, f"sessions started in this folder are kept under {where}, and were not read", log)
+    return found
 
 
 def session_id(path: Path) -> str:
@@ -77,24 +108,28 @@ def log_stat(path: Path) -> tuple[str, float]:
     return files_stat(files, path.parent)
 
 
-def _full_result(content, session_dir: Path):
+def _full_result(content, session_dir: Path, log: Path):
     """A tool result's complete output: the saved file replaces Claude Code's preview, and images are dropped."""
     if isinstance(content, str) and (match := PERSISTED_OUTPUT.match(content)):
         saved = session_dir / "tool-results" / match.group(1)
         if saved.is_file():
             return saved.read_text(encoding="utf-8", errors="replace")
+    elif isinstance(content, str) and content.lstrip().startswith("<persisted-output>"):
+        formats.note(TOOL, "a tool output saved to a file does not name its file, so only its preview was read", log)
     if isinstance(content, list):
         # Base64 images would otherwise be rendered into the transcript as text. A text block can hold a
         # preview too.
         return [
-            {**block, "text": _full_result(block["text"], session_dir)} if isinstance(block.get("text"), str) else block
+            {**block, "text": _full_result(block["text"], session_dir, log)}
+            if isinstance(block.get("text"), str)
+            else block
             for block in content
             if block.get("type") != "image"
         ]
     return content
 
 
-def _events(record: dict, session_dir: Path):
+def _events(record: dict, session_dir: Path, log: Path):
     """Turn one user or assistant record into transcript events. Thinking is left out, as in the official export."""
     content = record["message"]["content"]
     if isinstance(content, str):
@@ -115,9 +150,11 @@ def _events(record: dict, session_dir: Path):
             yield {
                 "type": "agent.tool_result",
                 "tool_use_id": block["tool_use_id"],
-                "content": _full_result(block.get("content"), session_dir),
+                "content": _full_result(block.get("content"), session_dir, log),
                 "is_error": block.get("is_error"),
             }
+        elif kind not in LEFT_OUT_BLOCKS:
+            formats.note(TOOL, f'a content block of type "{kind}" was left out of the transcript', log)
 
 
 def _preserved_by(records: list[dict], index: int) -> set:
@@ -176,14 +213,14 @@ def _log_events(path: Path, session_dir: Path) -> list[dict]:
     # In a trimmed log every summary is kept. Each may be all that is left of what it summarized, and the GC
     # can keep an earlier summary while deleting the messages it summarized and those after it.
     trimmed = _trimmed(records)
-    events, timed = [], None
+    events, timed, untimed = [], None, False
     for record in records:
         if trimmed and record.get("isCompactSummary"):
             written = (record.get("timestamp") or "")[:19]
             events.append({"type": SUMMARY_EVENT, **({"utc": f"{written}Z"} if written else {})})
             events.extend(
                 {"type": "agent.message", "content": event["content"]}
-                for event in _events(record, session_dir)
+                for event in _events(record, session_dir, path)
                 if event["type"] == "user.message"
             )
             continue
@@ -191,7 +228,10 @@ def _log_events(path: Path, session_dir: Path) -> list[dict]:
         # a model-written summary of earlier messages, which stay in the log unless it was trimmed.
         injected = record.get("isMeta") or record.get("isCompactSummary")
         if record.get("type") in ("user", "assistant") and not injected:
-            new = list(_events(record, session_dir))
+            new = list(_events(record, session_dir, path))
+            if any(event["type"] == "user.message" and event["content"].startswith(SUMMARY_OPENING) for event in new):
+                formats.note(TOOL, "a compaction summary is not marked as one, so it reads as a user message", path)
+            untimed = untimed or not record.get("timestamp")
             # A session can run for days or be resumed later, so each user message gets its own time, to the
             # second. Records logged at the same moment share one.
             time = (record.get("timestamp") or "")[:19]
@@ -199,6 +239,13 @@ def _log_events(path: Path, session_dir: Path) -> list[dict]:
                 events.append({"type": TIME_EVENT, "utc": f"{time}Z"})
                 timed = time
             events.extend(new)
+        elif record.get("type") not in ("user", "assistant", *NOT_CONVERSATION):
+            message = record.get("message")
+            if isinstance(message, dict) and message.get("role") in ("user", "assistant") and message.get("content"):
+                kind = record.get("type")
+                formats.note(TOOL, f'a record of type "{kind}" holds a message and was left out', path)
+    if untimed:
+        formats.note(TOOL, "a message has no timestamp, so the transcript does not say when it was sent", path)
     return events
 
 

@@ -60,9 +60,10 @@ def write_report(path: Path, record: dict) -> None:
         "kept for the latest runs only) and, if an agent's context "
         "was compacted, conversation_history/ (the messages compaction replaced) and large_tool_results/ "
         "(tool results moved out of a request that was too long)",
-        "",
-        "## Sessions",
     ]
+    if record["format_notice"]:
+        lines += ["", "## Log format", "", *record["format_notice"]]
+    lines += ["", "## Sessions"]
     for session in sessions:
         lines += ["", f"### {session['id']}: {session['status']}", f"- Source: {session['source']}"]
         if session.get("title"):

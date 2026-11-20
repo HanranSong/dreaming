@@ -17,7 +17,7 @@ from typing import NamedTuple
 
 from dotenv import load_dotenv
 
-from dreaming import codex, schedule
+from dreaming import codex, formats, schedule
 from dreaming import sessions as claude_code
 from dreaming.agent import MEMORY_PATH, UPLOADS_PATH, AgentRun, run_agent
 from dreaming.render import render_text
@@ -268,10 +268,15 @@ def _gained_content(session: Session, entry: dict, signature: str) -> bool:
     return changed
 
 
-def _analyze(session: Session, run_dir: Path) -> tuple[str, str | None, AgentRun | None]:
+def _analyze(session: Session, run_dir: Path, ignore_format: bool) -> tuple[str, str | None, AgentRun | None]:
     """Analyze one session. Returns its title, transcript digest and the agent's run (None if no conversation)."""
     try:
         title, text, digest = _render(session)
+        # The run read every session before it started, and stopped if a log held something unknown. One met
+        # only now is in a log that changed since. The session is left for the next run, which stops on it.
+        if formats.notes() and not ignore_format:
+            error = "its log changed during the run and now holds something this version of dreaming does not know"
+            return title, None, AgentRun(error=error)
         if text is None:
             return title, None, None
         (TRANSCRIPT_DIR / f"{session.id}.txt").write_text(text, encoding="utf-8")
@@ -314,10 +319,23 @@ def _missing_keys() -> list[str]:
     ]
 
 
+def _format_notice(*, stopped: bool) -> list[str]:
+    """What to tell the user when a reader met something it does not know in a log, or nothing."""
+    notes = formats.notes()
+    closing = formats.STOPPED if stopped else formats.CARRIED_ON
+    return [formats.NOTICE, *(f"- {note}" for note in notes), closing] if notes else []
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="dreaming",
         description="With no command, analyze the new sessions of the folder you are in into memory.",
+    )
+    parser.add_argument(
+        formats.IGNORE_FLAG,
+        action="store_true",
+        help="analyze the sessions even when their logs hold something this version does not know, which "
+        "otherwise stops the run before it analyzes any",
     )
     commands = parser.add_subparsers(dest="command", metavar="command")
     undo = commands.add_parser(
@@ -347,6 +365,8 @@ def _arguments() -> argparse.Namespace:
     arguments = parser.parse_args()
     if arguments.command == "schedule" and arguments.at and arguments.action != "on":
         parser.error("--at goes with: schedule on")
+    if arguments.command and arguments.ignore_log_format:
+        parser.error(f"{formats.IGNORE_FLAG} goes with a run, not with {arguments.command}")
     return arguments
 
 
@@ -377,7 +397,7 @@ def main() -> None:
         if arguments.command == "undo":
             _undo(arguments.run)
         else:
-            _run()
+            _run(arguments.ignore_log_format)
 
 
 def _undo(run_id: str | None) -> None:
@@ -445,7 +465,7 @@ def _undo(run_id: str | None) -> None:
     print(f"To reverse this undo: dreaming undo {undo_id}")
 
 
-def _run() -> None:
+def _run(ignore_format: bool = False) -> None:
     analyzer_window, organizer_window, compact_at_percent = _compaction()
     state = _load_state()
     sessions, organizer = state["sessions"], state["organizer"]
@@ -489,6 +509,16 @@ def _run() -> None:
     for session_id, reason in not_run:
         print(f"Not run {session_id}: {reason}")
 
+    # Every session to analyze is read before any is analyzed, so that a log this version cannot fully read
+    # stops the run before it has spent anything or changed memory.
+    for session in pending:
+        try:
+            session.reader.load_session(session.path)
+        except Exception:
+            pass  # a log that cannot be read at all fails its own session, in _analyze
+    if formats.notes() and not ignore_format:
+        raise SystemExit("\n".join(_format_notice(stopped=True)))
+
     organizer_gave_up = organizer["pending"] and organizer["attempts"] >= MAX_ATTEMPTS
     if not pending and (not organizer["pending"] or organizer_gave_up):
         if organizer_gave_up:
@@ -499,6 +529,8 @@ def _run() -> None:
                 "you start them in, which for a project is its root folder."
             )
         print("Nothing to do.")
+        for line in _format_notice(stopped=False):
+            print(line)
         if abandoned or organizer_gave_up:
             raise SystemExit(1)
         return
@@ -524,6 +556,7 @@ def _run() -> None:
         "started": datetime.now(UTC).isoformat(timespec="seconds"),
         "finished": None,
         "sessions": [],
+        "format_notice": [],
         "not_run": not_run,
         "organizer": {"status": "not needed"},
         "agents": [],  # (label, AgentRun) for the usage table
@@ -533,6 +566,7 @@ def _run() -> None:
     def checkpoint() -> None:
         _save_state(state)
         record["memory_changes"] = _memory_changes(run_dir / MEMORY_BEFORE)
+        record["format_notice"] = _format_notice(stopped=False)
         write_report(run_dir / "report.md", record)
 
     print(f"Run {run_id}: {len(pending)} session(s) to analyze.")
@@ -550,7 +584,7 @@ def _run() -> None:
         print(f"[{number}/{len(pending)}] {source} {session.id}: ", end="", flush=True)
 
         memory_before = _files(MEMORY_DIR)
-        result["title"], digest, run = _analyze(session, run_dir)
+        result["title"], digest, run = _analyze(session, run_dir, ignore_format)
         if run is None:
             entry["status"] = "skipped"
             result["note"] = "No conversation in this session."
@@ -614,6 +648,8 @@ def _run() -> None:
     record["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
     checkpoint()
     _prune_backups()
+    for line in _format_notice(stopped=False):
+        print(line)
     print(f"Report: {run_dir / 'report.md'}")
     statuses = [record["organizer"]["status"], *(session["status"] for session in record["sessions"])]
     if abandoned or "failed" in statuses or "gave up" in statuses:

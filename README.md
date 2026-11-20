@@ -70,6 +70,7 @@ analysis. Run it again whenever you like: sessions that are already done cost no
 | `ANTHROPIC_API_KEY is not set` (or `OPENAI_API_KEY`) | The models in `dreaming/.env` need that key. Fill it in there. |
 | `Not run <id>: waiting` | The session's log changed in the last 30 minutes, so it may still be in use. Run again later. |
 | `failed` | The session is retried on the next run, up to 3 attempts. |
+| `Log format: ...` then `Stopped` | A session log holds something this version does not know, listed under that line. Claude Code or Codex may have changed its log format, so a transcript could be missing something. The run stops before it analyzes any session: nothing is spent and memory is not changed. [Update](#update) dreaming and run again. To analyze anyway, add `--ignore-log-format` to the run command. |
 
 A run that analyzes a session calls the model and costs money. The cost of each agent is in the run's report.
 
@@ -130,6 +131,9 @@ uv run --project dreaming dreaming schedule off
 - **It spends money without asking.** A day with no new sessions costs nothing.
 - **Each run's output** is added to `dreaming/.state/schedule.log`, and its report is under
   `dreaming/.state/runs/` as usual.
+- **A scheduled run that stops on a log format it does not know** says so only in `schedule.log`: nothing
+  notifies you, and every night's run stops the same way until dreaming is updated or you run once by hand
+  with `--ignore-log-format`.
 - **The machine has to be on** at that time, but you do not have to be logged in. A run missed while the
   machine was off or asleep is skipped, and the next run takes its sessions.
 - **The schedule is one line in your crontab**, which `crontab -l` shows. Your other lines are left as they
@@ -182,6 +186,15 @@ To have Claude Code start every session with the index already in context, add t
 The path is relative to the `CLAUDE.md` that holds the line. Only the index is loaded this way. Claude Code
 still opens the topic files when it needs them, so keep the `AGENTS.md` note as well. `_index.md` exists only
 after the first run that analyzed a session.
+
+## Run the tests
+
+The tests cover how Claude Code's and Codex's session logs are read. They build small logs by hand, so they
+need no API key and call no model. From inside the `dreaming/` folder:
+
+```bash
+uv run pytest
+```
 
 ## Update
 
